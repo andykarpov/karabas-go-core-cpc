@@ -11,7 +11,7 @@ B=$SIM/build
 mkdir -p $B/v
 VHD=$(sed -n 's/^vhdl work "\(.*\)"/\1/p' $SRC/cpc.prj | sed "s#^#$SRC/#")
 VLOG=$(sed -n 's/^verilog work "\(.*\)"/\1/p' $SRC/cpc.prj | sed "s#^#$SRC/#")
-VLOG="$VLOG $SRC/../modules/rtl/mem/kg_fifo.v"
+VLOG="$VLOG $SRC/../modules/rtl/mem/kg_fifo.v $SRC/../modules/rtl/mem/kg_sdpram.v $SRC/rtl/karabas/cpc_video_out.v"
 if [ ! -f $B/vhdl_ghdl.v ] || [ -n "$(find $VHD vhdl2v.sh -newer $B/vhdl_ghdl.v 2>/dev/null)" ]; then
 	./vhdl2v.sh $B > $B/ghdl.log 2>&1 || { grep -v -i warning $B/ghdl.log | tail -30; exit 1; }
 fi

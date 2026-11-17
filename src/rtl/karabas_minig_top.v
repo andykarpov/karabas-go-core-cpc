@@ -13,10 +13,10 @@
  the system ROMs come from the .kg (roms/boot.rom, 160K, as the upstream boot.rom: OS6128 + BASIC 1.1
  + AMSDOS + MF2, OS664 + BASIC664 + AMSDOS + MF2, OS464 + BASIC464) when the core starts.
 
- Video: the 15.625 kHz picture of the Gate Array (1024 pixels of 16 MHz a line, 312 lines) through
- scandoubler (VIC20Nano / Till Harbaum): 1024 x 624 at 32 MHz (31.25 kHz, 50.08 Hz), de the window
- of H_DE_W x V_DE_H from H_DE_X / V_DE_Y (the CPC picture with its border in the middle), the OSD of
- link v2 over it, HDMI with audio. Syncs negative.
+ Video: the 15.625 kHz picture of the Gate Array (1024 pixels of 16 MHz a line, 312 lines) line-doubled
+ by cpc_video_out with its own timing: 1024 x 624 at 32 MHz (31.25 kHz, 50.08 Hz), syncs and de always
+ present (also in reset), de the window of H_DE_W x V_DE_H from H_DE_X / V_DE_Y (the CPC picture with
+ its border in the middle), the OSD of link v2 over it, HDMI with audio. Syncs negative.
 
  Audio: the AY (ABC stereo of upstream) + tape sound, to the PCM5102 and HDMI (48 kHz).
 
@@ -110,12 +110,12 @@ module karabas_minig_top (
 	output wire FLASH_HOLD_N
 );
 
-// the de window of the doubled picture (clk_pix, from the leading edge of the doubled hsync / the
-// first line after the leading edge of vsync); sim/run_boot.sh --geometry: 1024 x 624, hs 64, vs 4 lines
-localparam H_DE_X = 11'd203;   // the picture of the Gate Array (with its border): pixels 204..971 of the doubled line
-localparam H_DE_W = 11'd768;
-localparam V_DE_Y = 10'd45;    // its lines 61..605 (545) in the middle of 576
-localparam V_DE_H = 10'd576;
+// the de window of the doubled picture (cpc_video_out: pixels of the GA line from the rising edge of
+// its hsync, output lines from the line after its vsync); sim/run_boot.sh --geometry
+localparam H_DE_X = 204;   // the picture of the Gate Array with its border: pixels 204..971
+localparam H_DE_W = 768;
+localparam V_DE_Y = 45;    // its lines in the middle of 576
+localparam V_DE_H = 576;
 
 // ------------------------------------------------------------------ unused
 
@@ -339,59 +339,26 @@ assign TAPE_OUT = tape_out;
 
 // ------------------------------------------------------------------ video
 
-// the line doubler: a sample of the 16 MHz picture every 4 clocks, out every 2 (32 MHz)
-wire [7:0] sd_r, sd_g, sd_b;
-wire sd_hs, sd_vs, sd_hb, sd_vb;
-scandoubler #(.HCNT_WIDTH(11), .COLOR_DEPTH(6), .OUT_COLOR_DEPTH(8)) doubler (
+// the line-doubled picture with its own timing (syncs and de always present, cpc_video_out):
+// 1024 x 624 on clk_pix, de the window of the picture with its border
+wire [23:0] vid_rgb;
+wire vid_hs_o, vid_vs_o, vid_de;
+cpc_video_out #(.H_DE_X(H_DE_X), .H_DE_W(H_DE_W), .V_DE_Y(V_DE_Y), .V_DE_H(V_DE_H)) video_out (
 	.clk_sys(clk_sys),
-	.bypass(1'b0),
-	.ce_divider(3'd1),
-	.pixel_ena(),
-	.scanlines(2'b00),
-	.hb_in(vid_hbl),
-	.vb_in(vid_vbl),
-	.hs_in(vid_hs),
-	.vs_in(vid_vs),
-	.r_in(vid_r[7:2]),
-	.g_in(vid_g[7:2]),
-	.b_in(vid_b[7:2]),
-	.hb_out(sd_hb),
-	.vb_out(sd_vb),
-	.hs_out(sd_hs),
-	.vs_out(sd_vs),
-	.r_out(sd_r),
-	.g_out(sd_g),
-	.b_out(sd_b)
+	.vid_ce(vid_ce),
+	.vid_r(vid_r),
+	.vid_g(vid_g),
+	.vid_b(vid_b),
+	.vid_hs(vid_hs),
+	.vid_vs(vid_vs),
+	.vid_hbl(vid_hbl),
+	.vid_vbl(vid_vbl),
+	.clk_pix(clk_pix),
+	.rgb(vid_rgb),
+	.hs(vid_hs_o),
+	.vs(vid_vs_o),
+	.de(vid_de)
 );
-
-// into clk_pix (phase aligned, the doubler changes its outputs every 2 clk_sys); the de window
-reg [23:0] px_rgb = 24'd0;
-reg px_hs = 1'b0, px_vs = 1'b0, px_hs_d = 1'b0, px_vs_d = 1'b0, vs_seen = 1'b0;
-reg [10:0] hc = 11'd0;
-reg [9:0] vl = 10'd0;
-always @(posedge clk_pix) begin
-	px_rgb <= { sd_r, sd_g, sd_b };
-	px_hs <= sd_hs;
-	px_vs <= sd_vs;
-	px_hs_d <= px_hs;
-	px_vs_d <= px_vs;
-	hc <= (px_hs && !px_hs_d) ? 11'd0 : hc + 11'd1;
-	if (px_vs && !px_vs_d)
-		vs_seen <= 1'b1;
-	if (px_hs && !px_hs_d) begin
-		vl <= vs_seen ? 10'd0 : vl + 10'd1;
-		vs_seen <= 1'b0;
-	end
-end
-wire win = hc >= H_DE_X && hc < H_DE_X + H_DE_W && vl >= V_DE_Y && vl < V_DE_Y + V_DE_H;
-reg [23:0] vid_rgb = 24'd0;
-reg vid_hs_o = 1'b0, vid_vs_o = 1'b0, vid_de = 1'b0;   // syncs high active
-always @(posedge clk_pix) begin
-	vid_de <= win;
-	vid_rgb <= win ? px_rgb : 24'd0;
-	vid_hs_o <= px_hs;
-	vid_vs_o <= px_vs;
-end
 
 // the bitmap OSD of link v2 (kg_l2_osd_overlay): centred in de, the scale from its size,
 // 2 clocks of latency with its syncs and de

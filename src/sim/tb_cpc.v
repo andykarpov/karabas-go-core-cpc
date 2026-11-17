@@ -30,12 +30,12 @@ module tb_cpc (
 	output wire loading,
 	output wire [15:0] audio_l,
 
-	// the line doubler of the board tops (scandoubler, out every 2 clocks)
-	output wire sd_hs,
-	output wire sd_vs,
-	output wire sd_hb,
-	output wire sd_vb,
-	output wire [7:0] sd_r
+	// cpc_video_out of the board tops on clk_pix = clk_sys / 2 (phase aligned)
+	output reg clk_pix = 1'b0,
+	output wire [23:0] vo_rgb,
+	output wire vo_hs,
+	output wire vo_vs,
+	output wire vo_de
 );
 
 wire [20:0] MA;
@@ -94,11 +94,13 @@ cpc_core core (
 	.loading(loading)
 );
 
-scandoubler #(.HCNT_WIDTH(11), .COLOR_DEPTH(6), .OUT_COLOR_DEPTH(8)) doubler (
-	.clk_sys(clk_sys), .bypass(1'b0), .ce_divider(3'd1), .pixel_ena(), .scanlines(2'b00),
-	.hb_in(vid_hbl), .vb_in(vid_vbl), .hs_in(vid_hs), .vs_in(vid_vs),
-	.r_in(vid_r[7:2]), .g_in(vid_g[7:2]), .b_in(vid_b[7:2]),
-	.hb_out(sd_hb), .vb_out(sd_vb), .hs_out(sd_hs), .vs_out(sd_vs), .r_out(sd_r), .g_out(), .b_out()
+always @(posedge clk_sys)
+	clk_pix <= ~clk_pix;
+
+cpc_video_out video_out (
+	.clk_sys(clk_sys), .vid_ce(vid_ce), .vid_r(vid_r), .vid_g(vid_g), .vid_b(vid_b),
+	.vid_hs(vid_hs), .vid_vs(vid_vs), .vid_hbl(vid_hbl), .vid_vbl(vid_vbl),
+	.clk_pix(clk_pix), .rgb(vo_rgb), .hs(vo_hs), .vs(vo_vs), .de(vo_de)
 );
 
 endmodule

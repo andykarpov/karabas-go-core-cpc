@@ -7,7 +7,7 @@
 #                           -> measure/sv2v/, measure/cpc_measure.prj (make measure-xst)
 #   tools/sv2v.sh measure-classic   the same with KG_CLASSIC (Plus model forced Off, no CPR,
 #                           no SSM / snapshot save) -> measure/sv2v_classic/ (make measure-classic-xst)
-#   tools/sv2v.sh core      the core: cpc_core + the upstream it uses + scandoubler -> rtl/sv2v/,
+#   tools/sv2v.sh core      the core: cpc_core + the upstream it uses -> rtl/sv2v/,
 #                           cpc.prj (the source list of the core, the board .prj files add the tops)
 set -e
 cd "$(dirname "$0")/.."
@@ -28,11 +28,11 @@ measure|measure-classic)
 	  for f in $OUT/*.v; do echo "verilog work \"$f\""; done; } > $PRJ
 	ls $OUT | wc -l ;;
 core)
-	# the core: cpc_core (the board independent part) and the parts of the board tops
+	# the core: cpc_core (the board independent part); the tops add cpc_clocks, cpc_video_out
 	OUT=rtl/sv2v
 	rm -rf $OUT && mkdir $OUT
-	$SV2V -I ../upstream --top=cpc_core --top=scandoubler rtl/karabas/cpc_emu.sv rtl/karabas/cpc_mister_stubs.sv \
-		rtl/karabas/cpc_core.v rtl/karabas/cpc_sram.v ../modules/rtl/mem/kg_fifo.v rtl/misc/scandoubler.v \
+	$SV2V -I ../upstream --top=cpc_core rtl/karabas/cpc_emu.sv rtl/karabas/cpc_mister_stubs.sv \
+		rtl/karabas/cpc_core.v rtl/karabas/cpc_sram.v ../modules/rtl/mem/kg_fifo.v \
 		$RTL -w $OUT 2>&1 | grep -v -E '^\s*$|Warning: Number literal|^ *[0-9]* \||^\s*\|' || true
 	rm -f $OUT/kg_fifo.v   # the boards take it from modules/
 	{ for f in $VHDL; do echo "vhdl work \"$f\""; done
@@ -41,6 +41,7 @@ core)
 	for b in minig; do   # Go and Mini: Ф3 (tools/mktops.py)
 		{ cat tools/board_modules.prj; cat cpc.prj
 		  echo 'verilog work "rtl/karabas/cpc_clocks.v"'
+	  echo 'verilog work "rtl/karabas/cpc_video_out.v"'
 		  echo "verilog work \"rtl/karabas_${b}_top.v\""; } > karabas_$b.prj
 	done
 	ls $OUT | wc -l ;;

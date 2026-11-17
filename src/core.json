@@ -1,7 +1,7 @@
 {
     "id": "cpc",
     "name": "Amstrad CPC",
-    "build": "26111701",
+    "build": "26111702",
     "visible": true,
     "type": "osd",
     "order": 26,
@@ -16,7 +16,7 @@
     "boards": {
         "minig": {
             "link": 2,
-            "build": "26111701",
+            "build": "26111702",
             "bitstream": "karabas_minig.bin"
         }
     },

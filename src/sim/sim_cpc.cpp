@@ -4,7 +4,8 @@
 // line, blank areas dark grey) as PPM.
 //   sim_cpc [--ms N] [--ppm PREFIX] [--every N] [--model 0|1|2] [--crtc 0|1]
 //           [--key MS:CODE[:E]]... (a PS/2 set 2 key pressed at MS for 100 ms, E = extended)
-//           [--geometry] (prints the line / frame lengths and the picture window)
+//           [--geometry] (prints the line / frame lengths and the picture window, also of the output)
+//           [--ppm2 PREFIX] (the 1024 x 624 frames of cpc_video_out, de outside grey, syncs blue)
 #include "Vtb_cpc.h"
 #include "verilated.h"
 #include <cstdio>
@@ -31,6 +32,10 @@ int main(int argc, char **argv) {
 	std::string ppm;
 	int every = 25, model = 0, crtc = 0;
 	bool geometry = false;
+	std::string ppm2;
+	bool old_pix = false, ohs2 = false, ovs2 = false;
+	int hc2 = 0, vl2 = 0, ll2 = 0, frames2 = 0, dx0 = 99999, dx1 = -1, dy0 = 99999, dy1 = -1, x0 = 99999, x1 = -1, y0 = 99999, y1 = -1;
+	std::vector<uint8_t> frame2(1024 * 640 * 3, 0);
 	struct Key { uint64_t at; uint8_t code; bool ext; };
 	std::vector<Key> keys;
 	for (int i = 1; i < argc; i++) {
@@ -40,6 +45,7 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--model") && i + 1 < argc) model = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--crtc") && i + 1 < argc) crtc = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--geometry")) geometry = true;
+		else if (!strcmp(argv[i], "--ppm2") && i + 1 < argc) ppm2 = argv[++i];
 		else if (!strcmp(argv[i], "--key") && i + 1 < argc) {
 			Key k; unsigned c; double at; char e = 0;
 			if (sscanf(argv[++i], "%lf:%x:%c", &at, &c, &e) < 2) { fprintf(stderr, "bad --key\n"); return 1; }
@@ -128,36 +134,45 @@ int main(int argc, char **argv) {
 
 		tick();
 
-		// the doubled picture: a pixel every 2 clocks (clk_pix), counted from the rising edge of sd_hs;
-		// lines from the first rising edge of sd_hs after the rising edge of sd_vs
-		if (geometry && (clocks & 1)) {
-			static bool ohs = false, ovs = false, vseen = false;
-			static int hc = 0, vl = 0, ll = 0, frames2 = 0;
-			static int x0 = 99999, x1 = -1, y0 = 99999, y1 = -1, hsw = 0, vsl = 0;
-			bool shs = tb->sd_hs, svs = tb->sd_vs;
-			if (svs && !ovs) vseen = true;
-			if (shs && !ohs) {
-				ll = hc; hc = 0;
-				if (vseen) {
-					frames2++;
-					if (frames2 >= 3 && frames2 <= 4)
-						printf("doubled frame %d: %d lines, line %d, hs %d, vs lines %d, picture x %d..%d y %d..%d\n",
-						       frames2, vl, ll, hsw, vsl, x0, x1, y0, y1);
-					vl = 0; vseen = false; x0 = 99999; x1 = -1; y0 = 99999; y1 = -1; vsl = 0;
+		// the output of cpc_video_out at each rising edge of clk_pix: its frame, de and the non-black
+		// picture inside it; --geometry prints them, --ppm2 writes the 1024 x 624 frames
+		if (tb->clk_pix && !old_pix) {
+			bool shs = tb->vo_hs, svs = tb->vo_vs;
+			if (svs && !ovs2) {
+				frames2++;
+				if (geometry && frames2 >= 3 && frames2 <= 6)
+					printf("out frame %d: %d lines, line %d, de x %d..%d y %d..%d, picture x %d..%d y %d..%d\n",
+					       frames2, vl2, ll2, dx0, dx1, dy0, dy1, x0, x1, y0, y1);
+				if (!ppm2.empty() && frames2 % every == 0) {
+					char name[512];
+					snprintf(name, sizeof name, "%s%04d.ppm", ppm2.c_str(), frames2);
+					FILE *o = fopen(name, "wb");
+					fprintf(o, "P6 1024 640 255\n");
+					fwrite(frame2.data(), 1, frame2.size(), o);
+					fclose(o);
 				}
-				else vl++;
-				if (svs) vsl++;
+				vl2 = 0; dx0 = x0 = 99999; dx1 = x1 = -1; dy0 = y0 = 99999; dy1 = y1 = -1;
 			}
-			if (shs) { if (hc == 0) hsw = 0; hsw++; }
-			if (!tb->sd_hb && !tb->sd_vb) {
-				if (hc < x0) x0 = hc;
-				if (hc > x1) x1 = hc;
-				if (vl < y0) y0 = vl;
-				if (vl > y1) y1 = vl;
+			if (shs && !ohs2) { ll2 = hc2; hc2 = 0; vl2++; }
+			uint32_t c = tb->vo_rgb;
+			if (tb->vo_de) {
+				if (hc2 < dx0) dx0 = hc2; if (hc2 > dx1) dx1 = hc2;
+				if (vl2 < dy0) dy0 = vl2; if (vl2 > dy1) dy1 = vl2;
+				if (c) {
+					if (hc2 < x0) x0 = hc2; if (hc2 > x1) x1 = hc2;
+					if (vl2 < y0) y0 = vl2; if (vl2 > y1) y1 = vl2;
+				}
 			}
-			hc++;
-			ohs = shs; ovs = svs;
+			if (hc2 < 1024 && vl2 < 640) {
+				uint8_t *p = &frame2[(vl2 * 1024 + hc2) * 3];
+				p[0] = c >> 16; p[1] = c >> 8; p[2] = c;
+				if (!tb->vo_de) { p[0] = p[1] = p[2] = 40; }
+				if (shs || svs) { p[0] = 0; p[1] = 0; p[2] = 96; }
+			}
+			hc2++;
+			ohs2 = shs; ovs2 = svs;
 		}
+		old_pix = tb->clk_pix;
 
 		if (tb->vid_ce) {
 			bool hs = tb->vid_hs, vs = tb->vid_vs;
