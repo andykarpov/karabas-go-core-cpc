@@ -252,11 +252,19 @@ TIMESPEC "TS_SRAM_IN" = FROM "TG_SRAM_IN" TO FFS 4 ns DATAPATHONLY;
 # clk_sys periods. The keys and pads (kg_l2_hid, the key matrix of hid.sv) are user input, a clock
 # later is the same: two periods too. Worst paths of 26111701 were T80 internal, joy_r / key -> the
 # T80 decoder, at 0.35 ns slack.
-INST "core/emu/motherboard/CPU/u0/*" TNM = "TG_T80";
+# (the whole CPU: T80pa also changes RD_n / WR_n / IORQ_n / MREQ_n / DI_Reg only on CEN_p / CEN_n, every
+# 8 clk_sys; build 26111705 failed on CPU/RD_n -> crtc)
+INST "core/emu/motherboard/CPU/*" TNM = "TG_T80";
 INST "mcu/u_hid/*" TNM = "TG_KEYS";
 INST "core/emu/motherboard/HID/*" TNM = "TG_KEYS";
 TIMESPEC "TS_T80_MC" = FROM "TG_T80" TO "TG_CLK_SYS" 31.25 ns;
 TIMESPEC "TS_KEYS_MC" = FROM "TG_KEYS" TO "TG_CLK_SYS" 31.25 ns;
+# The counters of the CRTC (hcc, row, row_addr / row_addr_r) change only on its character clock enable
+# CLKEN (1 MHz, every 64 clk_sys; all enables of the GA are on the ce_16 grid, 4 clk_sys apart): paths
+# from them get two periods (26111705: crtc/row -> VSYNC_r / row_addr_r failed by 0.6 ns at 87 % slices).
+INST "core/emu/motherboard/crtc/row_*" TNM = "TG_CRTC_CNT";
+INST "core/emu/motherboard/crtc/hcc_*" TNM = "TG_CRTC_CNT";
+TIMESPEC "TS_CRTC_MC" = FROM "TG_CRTC_CNT" TO "TG_CLK_SYS" 31.25 ns;
 # u765 (as the Amstrad.sdc of MiSTer: "-to u765|i_* -setup 2"): its registers named i_* change only on
 # its clock enable (8 MHz) ("prefix internal CE protected registers with i_, so it's easier to write
 # constraints"), so the paths into them get two clk_sys periods.
