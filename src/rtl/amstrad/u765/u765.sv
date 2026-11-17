@@ -613,8 +613,10 @@ always @(posedge clk_sys) begin : fdc
 			begin
 				$display("reload trackinfo: drive %d track %d", i_current_drive, pcn[i_current_drive]);
 				if (!tinfo_lock) begin
-					sector_byte_pos[i_current_drive] <= '{ 0, 0 };
-					begin i_current_track_sectors[{i_current_drive, 1'b0}] <= 0; i_current_track_sectors[{i_current_drive, 1'b1}] <= 0; end // karabas: 1-D
+					for (int d = 0; d < 2; d++) if (d == i_current_drive) begin // karabas: constant drive index (XST made tristates of the [i_current_drive] writes and lost their order)
+						sector_byte_pos[d] <= '{ 0, 0 };
+						i_current_track_sectors[{d[0], 1'b0}] <= 0; i_current_track_sectors[{d[0], 1'b1}] <= 0; // karabas: 1-D
+					end
 					next_weak_sector[i_current_drive] <= 0;
 					image_track_offsets_addr <= { i_current_drive, pcn[i_current_drive], 1'b0 };
 					tinfo_ds0 <= i_current_drive;
@@ -632,7 +634,7 @@ always @(posedge clk_sys) begin : fdc
 					seek_state[i_current_drive] <= 5;
 				end else begin
 					$display("reload trackinfo: empty track");
-					i_current_track_sectors[{i_current_drive, tinfo_hds}] <= 0;
+					for (int d = 0; d < 2; d++) if (d == i_current_drive) for (int h = 0; h < 2; h++) if (h == tinfo_hds) i_current_track_sectors[{d[0], h[0]}] <= 0; // karabas: constant drive index (XST made tristates of the [i_current_drive] writes and lost their order)
 					tinfo_lock <= 0;
 					image_trackinfo_dirty[i_current_drive] <= 0;
 					seek_state[i_current_drive] <= 0;
@@ -650,7 +652,7 @@ always @(posedge clk_sys) begin : fdc
 
 			6:
 			if (!tinfo_wait) begin
-				gap3[i_current_drive][tinfo_hds] <= tinfo_data;
+				for (int d = 0; d < 2; d++) if (d == i_current_drive) gap3[d][tinfo_hds] <= tinfo_data; // karabas: constant drive index (XST made tristates of the [i_current_drive] writes and lost their order)
 				tinfo_addr <= {image_track_offsets_in[0], 8'h15}; //number of sectors
 				tinfo_wait <= 1;
 				seek_state[i_current_drive] <= 7;
@@ -659,14 +661,16 @@ always @(posedge clk_sys) begin : fdc
 
 			7:
 			if (!tinfo_wait) begin
-				i_current_track_sectors[{i_current_drive, tinfo_hds}] <= tinfo_data;
+				for (int d = 0; d < 2; d++) if (d == i_current_drive) begin // karabas: constant drive index (XST made tristates of the [i_current_drive] writes and lost their order)
+					for (int h = 0; h < 2; h++) if (h == tinfo_hds) i_current_track_sectors[{d[0], h[0]}] <= tinfo_data;
 
-				//assume the head position is at the start of a track after a seek
-				if (i_current_sector_pos[i_current_drive][tinfo_hds] >= tinfo_data) begin
-					i_next_sector_pos[i_current_drive][tinfo_hds] <= 0;
-					i_rpm_timer[i_current_drive][tinfo_hds] <= 0;
-				end else
-					i_next_sector_pos[i_current_drive][tinfo_hds] <= i_current_sector_pos[i_current_drive][tinfo_hds];
+					//assume the head position is at the start of a track after a seek
+					if (i_current_sector_pos[d][tinfo_hds] >= tinfo_data) begin
+						i_next_sector_pos[d][tinfo_hds] <= 0;
+						i_rpm_timer[d][tinfo_hds] <= 0;
+					end else
+						i_next_sector_pos[d][tinfo_hds] <= i_current_sector_pos[d][tinfo_hds];
+				end
 
 				if (tinfo_hds == image_sides[i_current_drive]) begin
 					tinfo_lock <= 0;
@@ -793,38 +797,38 @@ always @(posedge clk_sys) begin : fdc
 		endcase
 
 		//disk rotation
-		if (motor[i_current_drive]) begin
+		for (int d = 0; d < 2; d++) if (d == i_current_drive && motor[d]) begin // karabas: constant drive index (XST made tristates of the [i_current_drive] writes and lost their order)
 			for (int i=0; i<2 ;i++) begin
-				if (i_secinfo_valid[i_current_drive][i])
-					i_rpm_timer[i_current_drive][i] <= i_rpm_timer[i_current_drive][i] + 1'd1;
+				if (i_secinfo_valid[d][i])
+					i_rpm_timer[d][i] <= i_rpm_timer[d][i] + 1'd1;
 
 `ifdef U765_DEBUG
-				if (sector_byte_pos[i_current_drive][i] == SECTOR_SYNC1_START) dbg_sector_state[i_current_drive][i] <= SECTOR_SYNC1;
-				if (sector_byte_pos[i_current_drive][i] == SECTOR_IDAM_POS)    dbg_sector_state[i_current_drive][i] <= SECTOR_ID;
-				if (sector_byte_pos[i_current_drive][i] == SECTOR_SYNC2_START) dbg_sector_state[i_current_drive][i] <= SECTOR_SYNC2;
-				if (sector_byte_pos[i_current_drive][i] == SECTOR_DATA_START)  dbg_sector_state[i_current_drive][i] <= SECTOR_DATA;
+				if (sector_byte_pos[d][i] == SECTOR_SYNC1_START) dbg_sector_state[d][i] <= SECTOR_SYNC1;
+				if (sector_byte_pos[d][i] == SECTOR_IDAM_POS)    dbg_sector_state[d][i] <= SECTOR_ID;
+				if (sector_byte_pos[d][i] == SECTOR_SYNC2_START) dbg_sector_state[d][i] <= SECTOR_SYNC2;
+				if (sector_byte_pos[d][i] == SECTOR_DATA_START)  dbg_sector_state[d][i] <= SECTOR_DATA;
 `endif
 
-				if (i_secinfo_valid[i_current_drive][i] & i_byte_clk_en) begin
-					sector_byte_pos[i_current_drive][i] <= sector_byte_pos[i_current_drive][i] + 1'd1;
+				if (i_secinfo_valid[d][i] & i_byte_clk_en) begin
+					sector_byte_pos[d][i] <= sector_byte_pos[d][i] + 1'd1;
 
-					if (sector_byte_pos[i_current_drive][i] >= (sector_end_pos[i_current_drive][i] + gap3[i_current_drive][i])) begin
-						if ((i_current_sector_pos[i_current_drive][i] == i_current_track_sectors[{i_current_drive, i[0]}] - 1'd1) ||
-						 (i_current_track_sectors[{i_current_drive, i[0]}] == 0))
+					if (sector_byte_pos[d][i] >= (sector_end_pos[d][i] + gap3[d][i])) begin
+						if ((i_current_sector_pos[d][i] == i_current_track_sectors[{d[0], i[0]}] - 1'd1) ||
+						 (i_current_track_sectors[{d[0], i[0]}] == 0))
 						begin
 							// end of last sector
-							if (i_rpm_timer[i_current_drive][i] >= TRACK_TIME) begin
+							if (i_rpm_timer[d][i] >= TRACK_TIME) begin
 								// end of track after 200ms
-								i_next_sector_pos[i_current_drive][i] <= 0;
-								sector_byte_pos[i_current_drive][i] <= 0;
-								i_secinfo_valid[i_current_drive][i] <= 0;
-								i_rpm_timer[i_current_drive][i] <= 0;
+								i_next_sector_pos[d][i] <= 0;
+								sector_byte_pos[d][i] <= 0;
+								i_secinfo_valid[d][i] <= 0;
+								i_rpm_timer[d][i] <= 0;
 							end
 						end
 						else begin
-							i_next_sector_pos[i_current_drive][i] <= i_current_sector_pos[i_current_drive][i] + 1'd1;
-							sector_byte_pos[i_current_drive][i] <= 0;
-							i_secinfo_valid[i_current_drive][i] <= 0;
+							i_next_sector_pos[d][i] <= i_current_sector_pos[d][i] + 1'd1;
+							sector_byte_pos[d][i] <= 0;
+							i_secinfo_valid[d][i] <= 0;
 						end
 					end
 				end

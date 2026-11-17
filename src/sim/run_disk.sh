@@ -10,4 +10,4 @@ if [ ! -x $B/Vtb_disk ] || [ -n "$(find $SRC sim/run_disk.sh -newer $B/Vtb_disk 
 	verilator --binary --timing -O2 -Wno-fatal -Wno-lint -Wno-style --top-module tb_disk -Mdir $B $SRC \
 		> $B/verilator.log 2>&1 || { grep -E '%Error' $B/verilator.log | head; exit 1; }
 fi
-$B/Vtb_disk ${1:++dsk=$1} | grep -v -E '^(sector found|reload)'
+$B/Vtb_disk ${1:++dsk=$1} ${@:2} | grep -v -E '^(sector found|reload)'

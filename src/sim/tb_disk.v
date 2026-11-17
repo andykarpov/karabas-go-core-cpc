@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 // u765 (rtl/sv2v) behind cpc_sd_sdc, against a model of the file mounter of kg_mcu2 (the contract of
 // img_sdc: sdc_busy when a request is taken, the 512 bytes of a read as sdc_byte_in_strobe / addr /
-// data, the bytes of a write taken from sdc_byte_out_data OUT_LATENCY = 2 clocks after sdc_byte_addr,
+// data, the bytes of a write taken from sdc_byte_out_data OUT_LATENCY (+olat, default 3) clocks after sdc_byte_addr,
 // then sdc_done). The disk is a .dsk file in an array. The CPU side: FDC commands through the data /
 // status registers as the CPC firmware does (Specify, Recalibrate, Sense Interrupt, Read ID, Read Data
 // of sector C1 compared with the file, Write Data of sector C2 and a Read Data of it back).
@@ -19,6 +19,8 @@ always @(posedge clk) begin
 end
 
 reg reset = 1'b1;
+reg fast = 1'b0;
+reg [7:0] rd_cmd = 8'h66;   // Read Data as AMSDOS sends it (MFM, SK); +cmd46 for 46   // +fast: no rotation delays (the board runs with 0)
 reg a0 = 1'b0, nRD = 1'b1, nWR = 1'b1;
 reg [7:0] din = 8'd0;
 wire [7:0] dout;
@@ -41,7 +43,7 @@ reg [7:0] sdc_byte_in_data = 8'd0;
 wire [7:0] sdc_byte_out_data;
 
 u765 fdc (
-	.reset(reset), .clk_sys(clk), .ce(ce), .fast(1'b1),   // fast: no rotation delays
+	.reset(reset), .clk_sys(clk), .ce(ce), .fast(fast),
 	.a0(a0), .ready({ 1'b0, |img_size_q }), .motor(2'b11), .available(2'b11),
 	.nRD(nRD), .nWR(nWR), .din(din), .dout(dout),
 	.img_mounted(img_mounted), .img_size(img_size[31:0]), .img_wp(img_readonly),
@@ -68,7 +70,7 @@ cpc_sd_sdc adapter (
 // ------------------------------------------------------------------ the mounter model
 
 reg [7:0] disk [0:1048575];
-integer disk_len, fd, k, errors = 0, reads = 0, writes = 0;
+integer disk_len, fd, k, errors = 0, reads = 0, writes = 0, lat = 200, olat = 3;   // +olat=N: IMG_OUT_LATENCY of the top; +lat=N: clocks before a read is served (the real mounter: 5..15 ms = 320k..960k)
 reg [8*256-1:0] dskname;
 
 task mounter;
@@ -83,27 +85,35 @@ task mounter;
 				sdc_slot <= slot;
 				sdc_busy <= 1'b1;
 				if (n) begin
-					// copy the sector of the requester: address out, the byte 2 clocks later
-					for (i = 0; i < 514; i = i + 1) begin
+					// as kg_l2_img (S_CADDR / S_CDATA): the address out, the byte taken at the edge
+					// OUT_LATENCY clocks later (its value just before that edge)
+					for (i = 0; i < 512; i = i + 1) begin
 						@(posedge clk);
-						if (i < 512) sdc_byte_addr <= i;
-						if (i >= 2) disk[lba * 512 + i - 2] = sdc_byte_out_data;
+						sdc_byte_addr <= i;
+						repeat (olat - 1) @(posedge clk);
+						@(negedge clk);
+						disk[lba * 512 + i] = sdc_byte_out_data;
 					end
 					writes = writes + 1;
 				end
 				else begin
-					repeat (200) @(posedge clk);
+					repeat (lat) @(posedge clk);
+					// as kg_l2_img (S_OADDR / S_ODATA): a byte every 3 clocks, sdc_done the clock after
+					// the address state that sees 512
 					for (i = 0; i < 512; i = i + 1) begin
+						@(posedge clk);
+						sdc_byte_in_strobe <= 1'b0;
+						@(posedge clk);
 						@(posedge clk);
 						sdc_byte_addr <= i;
 						sdc_byte_in_data <= (lba * 512 + i < disk_len) ? disk[lba * 512 + i] : 8'h00;
 						sdc_byte_in_strobe <= 1'b1;
-						@(posedge clk);
-						sdc_byte_in_strobe <= 1'b0;
 					end
+					@(posedge clk);
+					sdc_byte_in_strobe <= 1'b0;
 					reads = reads + 1;
 				end
-				repeat (20) @(posedge clk);
+				@(posedge clk);
 				sdc_done <= 1'b1;
 				sdc_busy <= 1'b0;
 				@(posedge clk);
@@ -188,7 +198,7 @@ task read_sector(input [7:0] r, input integer check_off, input [7:0] fill);
 	reg [7:0] b;
 	integer i, bad;
 	begin
-		cmd(8'h46); cmd(8'h00); cmd(8'h00); cmd(8'h00); cmd(r); cmd(8'h02); cmd(r); cmd(8'h2A); cmd(8'hFF);
+		cmd(rd_cmd); cmd(8'h00); cmd(8'h00); cmd(8'h00); cmd(r); cmd(8'h02); cmd(r); cmd(8'h2A); cmd(8'hFF);
 		bad = 0;
 		for (i = 0; i < 512; i = i + 1) begin
 			res(b);
@@ -215,6 +225,10 @@ endtask
 reg [7:0] b, st0, pcn;
 integer i;
 initial begin
+	if ($test$plusargs("fast")) fast = 1'b1;
+	if ($test$plusargs("cmd46")) rd_cmd = 8'h46;
+	if ($value$plusargs("olat=%d", olat)) $display("tb_disk: write out latency %0d clocks", olat);
+	if ($value$plusargs("lat=%d", lat)) $display("tb_disk: read latency %0d clocks", lat);
 	if (!$value$plusargs("dsk=%s", dskname)) dskname = "rtl/amstrad/u765/test.dsk";
 	fd = $fopen(dskname, "rb");
 	if (fd == 0) begin $display("ERROR: no %0s", dskname); $finish; end
@@ -226,7 +240,11 @@ initial begin
 	reset <= 1'b0;
 	repeat (100) @(posedge clk);
 
-	// mount drive A
+	// mount drive A as the firmware does it (link_img_mount): an eject (size 0), then the image,
+	// a link packet (a few us) apart
+	@(posedge clk); sdc_img_size <= 64'd0; sdc_img_mounted <= 8'h01;
+	@(posedge clk); sdc_img_mounted <= 8'h00;
+	repeat (300) @(posedge clk);
 	@(posedge clk); sdc_img_size <= disk_len; sdc_img_mounted <= 8'h01;
 	@(posedge clk); sdc_img_mounted <= 8'h00;
 	repeat (50000) @(posedge clk);
@@ -248,7 +266,9 @@ initial begin
 	if (st0[7:6] == 2'b00) $display("PASS read ID: ST0 %02h R %02h", st0, pcn);
 	else begin $display("ERROR: read ID ST0 %02h", st0); errors = errors + 1; end
 
-	read_sector(disk[256 + 8'h18 + 2], sector_offset(disk[256 + 8'h18 + 2]), 8'h00);
+	// the directory as AMSDOS reads it: sectors 1..4 of track 0, one Read Data each
+	for (k = 0; k < 4; k = k + 1)
+		read_sector(disk[256 + 8'h18 + k * 8 + 2], sector_offset(disk[256 + 8'h18 + k * 8 + 2]), 8'h00);
 
 	// Write Data: the second sector of the track with a pattern, then read it back
 	k = disk[256 + 8'h18 + 8 + 2];
@@ -270,7 +290,7 @@ initial begin
 end
 
 initial begin
-	#300000000;
+	#3000000000;
 	$display("ERROR: timeout");
 	$display("tb_disk: %0d errors", errors + 1);
 	$finish;

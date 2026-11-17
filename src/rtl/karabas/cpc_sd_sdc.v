@@ -12,7 +12,7 @@
    sdc_slot n): sd_ack is high from then until sdc_done of that slot;
  - read: the bytes of the mounter (sdc_byte_in_strobe / addr / data) are sd_buff_wr / addr / dout;
  - write: the mounter copies the sector by sdc_byte_addr and takes sdc_byte_out_data OUT_LATENCY
-   (kg_mcu2 IMG_OUT_LATENCY = 2) clocks later: sd_buff_addr is the address, sd_buff_din comes from
+   (kg_mcu2 IMG_OUT_LATENCY = 3) clocks later: sd_buff_addr is the address, sd_buff_din comes from
    the dual port RAM of u765 a clock later and is registered here once more;
  - mount: sdc_img_mounted[n] (one clock, sdc_img_size, img_wp[n]) = img_mounted[n] with img_size and
    img_readonly.

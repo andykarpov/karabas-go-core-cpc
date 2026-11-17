@@ -493,9 +493,15 @@ module u765 (
 				3: begin
 					$display("reload trackinfo: drive %d track %d", i_current_drive, pcn[(1 - i_current_drive) * 8+:8]);
 					if (!tinfo_lock) begin
-						sector_byte_pos[i_current_drive] <= 34'h000000000;
-						i_current_track_sectors[{i_current_drive, 1'b0}] <= 0;
-						i_current_track_sectors[{i_current_drive, 1'b1}] <= 0;
+						begin : sv2v_autoblock_2
+							reg signed [31:0] d;
+							for (d = 0; d < 2; d = d + 1)
+								if (d == i_current_drive) begin
+									sector_byte_pos[d] <= 34'h000000000;
+									i_current_track_sectors[{d[0], 1'b0}] <= 0;
+									i_current_track_sectors[{d[0], 1'b1}] <= 0;
+								end
+						end
 						next_weak_sector[i_current_drive] <= 0;
 						image_track_offsets_addr <= {i_current_drive, pcn[(1 - i_current_drive) * 8+:8], 1'b0};
 						tinfo_ds0 <= i_current_drive;
@@ -513,7 +519,16 @@ module u765 (
 						end
 						else begin
 							$display("reload trackinfo: empty track");
-							i_current_track_sectors[{i_current_drive, tinfo_hds}] <= 0;
+							begin : sv2v_autoblock_3
+								reg signed [31:0] d;
+								for (d = 0; d < 2; d = d + 1)
+									if (d == i_current_drive) begin : sv2v_autoblock_4
+										reg signed [31:0] h;
+										for (h = 0; h < 2; h = h + 1)
+											if (h == tinfo_hds)
+												i_current_track_sectors[{d[0], h[0]}] <= 0;
+									end
+							end
 							tinfo_lock <= 0;
 							image_trackinfo_dirty[i_current_drive] <= 0;
 							seek_state[(1 - i_current_drive) * 3+:3] <= 0;
@@ -529,7 +544,12 @@ module u765 (
 						sd_rd_tinfo <= 0;
 				6:
 					if (!tinfo_wait) begin
-						gap3[i_current_drive][tinfo_hds] <= tinfo_data;
+						begin : sv2v_autoblock_5
+							reg signed [31:0] d;
+							for (d = 0; d < 2; d = d + 1)
+								if (d == i_current_drive)
+									gap3[d][tinfo_hds] <= tinfo_data;
+						end
 						tinfo_addr <= {image_track_offsets_in[0], 8'h15};
 						tinfo_wait <= 1;
 						seek_state[(1 - i_current_drive) * 3+:3] <= 7;
@@ -537,13 +557,24 @@ module u765 (
 					end
 				7:
 					if (!tinfo_wait) begin
-						i_current_track_sectors[{i_current_drive, tinfo_hds}] <= tinfo_data;
-						if (i_current_sector_pos[i_current_drive][(1 - tinfo_hds) * 8+:8] >= tinfo_data) begin
-							i_next_sector_pos[i_current_drive][tinfo_hds] <= 0;
-							i_rpm_timer[i_current_drive][tinfo_hds] <= 0;
+						begin : sv2v_autoblock_6
+							reg signed [31:0] d;
+							for (d = 0; d < 2; d = d + 1)
+								if (d == i_current_drive) begin
+									begin : sv2v_autoblock_7
+										reg signed [31:0] h;
+										for (h = 0; h < 2; h = h + 1)
+											if (h == tinfo_hds)
+												i_current_track_sectors[{d[0], h[0]}] <= tinfo_data;
+									end
+									if (i_current_sector_pos[d][(1 - tinfo_hds) * 8+:8] >= tinfo_data) begin
+										i_next_sector_pos[d][tinfo_hds] <= 0;
+										i_rpm_timer[d][tinfo_hds] <= 0;
+									end
+									else
+										i_next_sector_pos[d][tinfo_hds] <= i_current_sector_pos[d][(1 - tinfo_hds) * 8+:8];
+								end
 						end
-						else
-							i_next_sector_pos[i_current_drive][tinfo_hds] <= i_current_sector_pos[i_current_drive][(1 - tinfo_hds) * 8+:8];
 						if (tinfo_hds == image_sides[i_current_drive]) begin
 							tinfo_lock <= 0;
 							image_trackinfo_dirty[i_current_drive] <= 0;
@@ -651,30 +682,34 @@ module u765 (
 						sector_search_state <= 3;
 					end
 			endcase
-			if (motor[i_current_drive]) begin : sv2v_autoblock_2
-				reg signed [31:0] i;
-				for (i = 0; i < 2; i = i + 1)
-					begin
-						if (i_secinfo_valid[((1 - i_current_drive) * 2) + (1 - i)])
-							i_rpm_timer[i_current_drive][i] <= i_rpm_timer[i_current_drive][i] + 1'd1;
-						if (i_secinfo_valid[((1 - i_current_drive) * 2) + (1 - i)] & i_byte_clk_en) begin
-							sector_byte_pos[i_current_drive][(1 - i) * 17+:17] <= sector_byte_pos[i_current_drive][(1 - i) * 17+:17] + 1'd1;
-							if (sector_byte_pos[i_current_drive][(1 - i) * 17+:17] >= (sector_end_pos[i_current_drive][i] + gap3[i_current_drive][i])) begin
-								if ((i_current_sector_pos[i_current_drive][(1 - i) * 8+:8] == (i_current_track_sectors[{i_current_drive, i[0]}] - 1'd1)) || (i_current_track_sectors[{i_current_drive, i[0]}] == 0)) begin
-									if (i_rpm_timer[i_current_drive][i] >= TRACK_TIME) begin
-										i_next_sector_pos[i_current_drive][i] <= 0;
-										sector_byte_pos[i_current_drive][(1 - i) * 17+:17] <= 0;
-										i_secinfo_valid[((1 - i_current_drive) * 2) + (1 - i)] <= 0;
-										i_rpm_timer[i_current_drive][i] <= 0;
+			begin : sv2v_autoblock_8
+				reg signed [31:0] d;
+				for (d = 0; d < 2; d = d + 1)
+					if ((d == i_current_drive) && motor[d]) begin : sv2v_autoblock_9
+						reg signed [31:0] i;
+						for (i = 0; i < 2; i = i + 1)
+							begin
+								if (i_secinfo_valid[((1 - d) * 2) + (1 - i)])
+									i_rpm_timer[d][i] <= i_rpm_timer[d][i] + 1'd1;
+								if (i_secinfo_valid[((1 - d) * 2) + (1 - i)] & i_byte_clk_en) begin
+									sector_byte_pos[d][(1 - i) * 17+:17] <= sector_byte_pos[d][(1 - i) * 17+:17] + 1'd1;
+									if (sector_byte_pos[d][(1 - i) * 17+:17] >= (sector_end_pos[d][i] + gap3[d][i])) begin
+										if ((i_current_sector_pos[d][(1 - i) * 8+:8] == (i_current_track_sectors[{d[0], i[0]}] - 1'd1)) || (i_current_track_sectors[{d[0], i[0]}] == 0)) begin
+											if (i_rpm_timer[d][i] >= TRACK_TIME) begin
+												i_next_sector_pos[d][i] <= 0;
+												sector_byte_pos[d][(1 - i) * 17+:17] <= 0;
+												i_secinfo_valid[((1 - d) * 2) + (1 - i)] <= 0;
+												i_rpm_timer[d][i] <= 0;
+											end
+										end
+										else begin
+											i_next_sector_pos[d][i] <= i_current_sector_pos[d][(1 - i) * 8+:8] + 1'd1;
+											sector_byte_pos[d][(1 - i) * 17+:17] <= 0;
+											i_secinfo_valid[((1 - d) * 2) + (1 - i)] <= 0;
+										end
 									end
 								end
-								else begin
-									i_next_sector_pos[i_current_drive][i] <= i_current_sector_pos[i_current_drive][(1 - i) * 8+:8] + 1'd1;
-									sector_byte_pos[i_current_drive][(1 - i) * 17+:17] <= 0;
-									i_secinfo_valid[((1 - i_current_drive) * 2) + (1 - i)] <= 0;
-								end
 							end
-						end
 					end
 			end
 			m_status[UPD765_MAIN_D0B] <= (seek_state[3+:3] == 1) | (seek_state[3+:3] == 2);

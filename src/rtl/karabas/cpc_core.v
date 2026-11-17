@@ -54,7 +54,7 @@ module cpc_core (
 	input wire [2:0] sw_display, // 0 colour (GA), 1 colour (ASIC), 2 green, 3 amber, 4 cyan, 5 white
 	input wire sw_reset,
 
-	// the file mounter of kg_mcu2 (ENABLE_IMG, IMG_OUT_LATENCY 2): drives A / B = slots 0 / 1
+	// the file mounter of kg_mcu2 (ENABLE_IMG, IMG_OUT_LATENCY 3): drives A / B = slots 0 / 1
 	input wire [7:0] sdc_img_mounted,
 	input wire [63:0] sdc_img_size,
 	input wire [7:0] img_wp,

@@ -223,7 +223,7 @@ kg_mcu2 #(
 	.CAPS(16'h0014),     // bit 4: the core drives LD_READY, bit 2: write protected images
 	.ENABLE_OSD(1),
 	.ENABLE_IMG(1),
-	.IMG_OUT_LATENCY(2), // cpc_sd_sdc: sd_buff_din of u765 + a register
+	.IMG_OUT_LATENCY(3), // the address register of kg_l2_img, sd_buff_din of u765 (BRAM), the register of cpc_sd_sdc (2 wrote each byte one place later on the board)
 	.ENABLE_AUX(1),      // DEBUG_*: the state of the core (AT+KARABAS=debug:1, kg_board.py log)
 	.ENABLE_FT(1),
 	.ENABLE_SD2(1)

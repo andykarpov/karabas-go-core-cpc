@@ -266,11 +266,13 @@ INST "core/emu/motherboard/crtc/row_*" TNM = "TG_CRTC_CNT";
 INST "core/emu/motherboard/crtc/hcc_*" TNM = "TG_CRTC_CNT";
 TIMESPEC "TS_CRTC_MC" = FROM "TG_CRTC_CNT" TO "TG_CLK_SYS" 31.25 ns;
 # (no multicycle into u765: "-to u765|i_*" of MiSTer relaxes paths whose sources (the sector buffer the
-# mounter writes, the CPU bus) change at any clock, not only on the clock enable of u765; with it the
-# disk reads of 26111707 found no sector)
+# mounter writes, the CPU bus) change at any clock, not only on the clock enable of u765; it is unsafe,
+# so left out. The disk reads that hung on the board then (26111707..26111713) were not timing: XST made
+# tristates of the [i_current_drive] array writes of u765, fixed in its source in 26111714.)
 # Instead FROM the registers of u765 that change only on its clock enable (8 MHz; hds / ds0 and the
-# fdc.i_* of the fdc block, assigned only in its "else if (ce)" branch): two periods (26111711 without
-# it: hds -> fdc.i_sector_size / state by 0.6 ns at 98 % slices).
+# fdc.i_* of the fdc block, assigned in its "if (ce)" parts; the exceptions i_secinfo_valid /
+# i_current_sector_pos are also cleared on a mount, once, and held for long after): two periods
+# (26111711 without it: hds -> fdc.i_sector_size / state by 0.6 ns at 98 % slices).
 INST "core/emu/u765/hds*" TNM = "TG_U765_CE";
 INST "core/emu/u765/ds0*" TNM = "TG_U765_CE";
 INST "core/emu/u765/fdc.i_*" TNM = "TG_U765_CE";
