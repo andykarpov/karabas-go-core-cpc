@@ -377,9 +377,10 @@ kg_l2_osd_overlay osd (
 
 // ------------------------------------------------------------------ audio
 
-// MiSTer audio is unsigned: the DAC and HDMI take two's complement
-wire [15:0] snd_l = audio_l ^ 16'h8000;
-wire [15:0] snd_r = audio_r ^ 16'h8000;
+// MiSTer audio is unsigned with silence at 0 (AUDIO_S = 0): halved, as a positive two's complement
+// value (an XOR 8000 made silence -32768, a full scale DC: build 26111703)
+wire [15:0] snd_l = { 1'b0, audio_l[15:1] };
+wire [15:0] snd_r = { 1'b0, audio_r[15:1] };
 
 kg_pcm5102 #(.DIV_BITS(3)) dac (  // bck 4 MHz, 125 kHz
 	.clk(clk_sys),
