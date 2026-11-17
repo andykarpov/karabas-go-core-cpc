@@ -197,6 +197,10 @@ wire [6:0] joy2     = joydb_2ena ? joy2_db9 : joydb_1ena ? joy1_usb : joy2_usb;
 wire [63:0] load_status_in;
 wire load_status_set;
 wire [1:0] plus_model;
+`ifdef KG_CLASSIC
+wire [1:0] plus_model_loaded;
+assign plus_model = 2'b00; // karabas: classic-only build
+`endif
 
 hps_io #(.CONF_STR(CONF_STR), .VDNUM(2)) hps_io
 (
@@ -247,7 +251,11 @@ wire        tape_download = ioctl_download && (ioctl_index == 4);
 wire        dan_download = ioctl_download && (ioctl_index == 5);
 wire        dan_write_accepted;
 wire        sna_download = ioctl_download && (ioctl_index == 6);
+`ifdef KG_CLASSIC
+wire        cpr_download = 1'b0; // karabas: classic-only build
+`else
 wire        cpr_download = ioctl_download && (ioctl_index == 8);
+`endif
 wire        cpr_ioctl_wait;
 
 dandanator_loader_bounds dandanator_loader_bounds
@@ -734,7 +742,11 @@ plus_load_model load_model
  .sna_addr(ioctl_addr[7:0]),
  .sna_data(ioctl_dout),
  .sna_prepare(sna_apply_cnt == 3'd5),
+`ifdef KG_CLASSIC
+ .plus_model(plus_model_loaded), // karabas: classic-only build, Plus off
+`else
  .plus_model(plus_model),
+`endif
  .status_in(load_status_in),
  .status_set(load_status_set)
 );
@@ -1748,7 +1760,11 @@ amstrad_video_output video_output (
 // held in reset and issues no DDR3 traffic. The raster stamp uses the native
 // 16 MHz output timebase, the same one the capture comparison will use.
 
+`ifdef KG_CLASSIC
+wire ssm_enable = 1'b0; // karabas: classic-only build, no SSM markers
+`else
 wire ssm_enable = status[37];
+`endif
 
 wire [28:0] ssm_ddr_addr;
 wire [63:0] ssm_ddr_din;
@@ -1825,7 +1841,11 @@ assign DDRAM_CLK = clk_sys;
 
 reg old_save_osd = 1'b0;
 always @(posedge clk_sys) old_save_osd <= status[38];
+`ifdef KG_CLASSIC
+wire save_req = 1'b0; // karabas: classic-only build, no snapshot save
+`else
 wire save_req = status[38] & ~old_save_osd;
+`endif
 
 // Classic machine only, outside reset, downloads and snapshot apply. Plus
 // mode, the Dandanator and the Multiface II hold memory or mapping state the
