@@ -1,0 +1,1362 @@
+//============================================================================
+//  Amstrad Plus ASIC (AMS40489 "Arnold V") integrated video — CRTC type 3
+//  foundation: register file and horizontal character counter.
+//
+//  This module is the Plus-stream counterpart of the classic rtl/CRTC.v
+//  wrapper. Per docs/plus/architecture.md the ASIC's CRTC-3 is a new
+//  behavioural implementation, never a third personality inside the classic
+//  core. P1 scope (roadmap §5, architecture §4): CRTC3 counters, MA/RA, DE,
+//  both sync widths, VSYNC gate, +1µs display alignment; exact readback
+//  quirks stay in P5.
+//
+//  Technical information sourced from the "Amstrad CPC CRTC Compendium" by
+//  Longshot (CC BY-NC-ND).
+//
+//  The counter behaviour of this module follows The Amstrad CPC CRTC
+//  Compendium v1.10, Serge Querne (Longshot / Logon System),
+//  https://shaker.logonsystem.eu -- licensed CC BY-NC-ND 4.0. Its attribution
+//  directive requires this notice in the source of CRTC emulation modules and
+//  in the credits of any distributed product built from them. Individual
+//  rules cite their ACCC section at the point of implementation.
+//
+//  Deliberate exclusions (each must land with its own vectors later):
+//   - IVM C9/C4 counting, frame/C9 parity, the even-frame additional line,
+//     MID-VSYNC, and the odd-frame/odd-C4 VSYNC correction are implemented
+//     below for R8=3.  R8=1 sync-only interlace keeps ordinary body-line
+//     raster/address generation, adds the CRTC3/4 even-frame line, and applies
+//     its alternate-field VSYNC midpoint (FR §19.6.4 p.218 / §19.7.3 p.219;
+//     EN pp.218-219).
+//   - Light pen R16/R17: no light-pen strobe source is emulated. The
+//     registers are stored and readable since P5 (mod-8 map slots 0/1) and
+//     seedable from an SNA header (B8-5), but nothing at runtime ever writes
+//     them (named assumption at the readback section).
+//   - R4 deadline outcomes use board-shaped ENABLE timing (French §12.5
+//     p.103). There is no explicit ROM-select decode here; READY/A13
+//     qualification remains upstream. The selected-write outcome model
+//     and its generalization beyond R4->0 are implementation inferences.
+//
+//  P5 scope landed here: the mod-8 read map with stored R14/R15, the
+//  R10/R11 status group, and the full readback contract (section at the
+//  bottom of this file). The IN-performs-write trap is a property of the
+//  upstream bus wiring (the write strobe deliberately does not distinguish
+//  read from write cycles); the motherboard pins it.
+//============================================================================
+
+module asic_video
+(
+	input            CLOCK,
+	input            CLKEN,      // 1 µs character-clock enable
+	input            nRESET,
+
+	// CRTC register bus (type-3 port decode sits upstream of this module)
+	input            ENABLE,
+	input            nCS,
+	input            R_nW,
+	input            RS,
+	input      [7:0] DI,
+	output reg [7:0] DO,
+
+	// Raster timing outputs. DE follows the SKEW-DISPTMG programming
+	// (ACCC §19.2, types 0/3/4); MA is the current video pointer VMA and
+	// RA the scanline address C9 (which carries the adjustment index on
+	// types 3/4, ACCC §11.2.6).
+	output reg       HSYNC,
+	output reg       VSYNC,
+	output           DE,
+	output           FIELD,
+	output    [13:0] MA,
+	output     [4:0] RA,
+
+	// Horizontal counter tap for later raster consumers (PRI/sprites/DMA)
+	output     [7:0] HCC,
+
+	// Vertical counter taps: C4 char-row counter, C9 scanline-in-row
+	// counter (which doubles as the vertical-adjustment line index on
+	// types 3/4, ACCC §11.2.6), and the adjustment-active flag.
+	output     [6:0] LINE,
+	output     [4:0] ROW,
+	output           ADJ,
+
+	// Screen split & soft scroll control registers (P6, from asic_regs)
+	input      [7:0] SPLT,
+	input     [13:0] SSA,
+	input      [7:0] SSCR,
+
+	// ---- Locked-ASIC pixel path (P1 remainder, architecture §4/§7) ----
+	//
+	// Behavioral locked-ASIC Gate-Array emulation: decodes the video-memory
+	// word addressed by MA into pen numbers at the documented mode-dependent
+	// rate and translates pens plus border into 4-bit-per-channel RGB
+	// through the fixed legacy-colour table. Sources, cited at each point of
+	// use below:
+	//  - [KT] Kevin Thacker, "Extra CPC Plus Hardware Information",
+	//    cpctech.cpc-live.com/docs/cpcplus.html (via web.archive.org capture
+	//    20230923001014), Palette section: measured 32-entry hardware-colour
+	//    -> R,G,B table (mid level = 6). Cross-checked entry by entry against
+	//    this repository's own ga40010 netlist DAC equations during P1
+	//    extraction; all 32 agree.
+	//  - Byte/pixel structure per video mode: Grimware Gate Array page
+	//    (grimware.org/doku.php/documentations/devices/gatearray, §RMR,
+	//    "Byte/Pixel structure" table; already cited by rtl/color_mix.sv).
+	//    The checked-in netlist corroborates it: the mode-0 leftmost pixel
+	//    nibble {b1,b5,b3,b7} is exactly the netlist cidx tap order
+	//    {shift_reg[1],[5],[3],[7]} sampled on a freshly loaded register
+	//    (rtl/GA40010/video.sv).
+	//  - Two video bytes per CRTC character: ga40010 latches VIDEO_BUF twice
+	//    per character (vidbuf_clk_en, rtl/GA40010/ga40010.sv) and every CPC
+	//    display line spans 80 bytes at R1=40 characters — MA is a word
+	//    address. This port models that word directly.
+	input               PIXEN,     // 16 MHz dot enable; 16 dots per character
+	input      [15:0]   VIDEOD,    // VRAM word for the current MA address:
+	                               // {odd byte (second half), even byte}
+	input               MODE_UPDATE_EN, // qualified GA event; one CLOCK pulse
+	input      [1:0]    GAMODE,    // legacy GA screen mode (RMR VM bits)
+	input      [4:0]    BORDER_I,  // border hardware colour number
+	input      [79:0]   INKR_I,    // 16 x 5-bit ink hardware colours; entry
+	                               // k occupies INKR_I[k*5 +: 5]
+	output reg [3:0]    RGB_R,     // 4-bit levels per channel ([KT]: 0/6/15)
+	output reg [3:0]    RGB_G,
+	output reg [3:0]    RGB_B,
+	output reg [4:0]    PEN,       // observability for later raster consumers:
+	                               // {showing_border, decoded ink nibble}
+
+	// Sprite-plane interface (P4). HWRAP strobes the line seam (CLKEN
+	// edge with a live or retained terminal opportunity) for the sprite
+	// engine's horizontal scale; SPR_* is the composited sprite pixel,
+	// shown between the screen and the border (asic-reference §5
+	// priority: border > sprites > screen), under HSYNC force-blank.
+	output           HWRAP,
+	input            SPR_EN,
+	input     [11:0] SPR_RGB,
+
+	// ---- ASIC 12-bit palette port (asic-reference §6) ----
+	//
+	// On a Plus the pen/border lookup is the 32-entry 12-bit palette held
+	// in asic_regs, not the fixed 27-colour Gate-Array ROM: PAL_ADDR names
+	// the entry this dot needs (pen 0-15 inside DE, entry 16 for the
+	// border) and PAL_RGB returns it as {G,R,B} nibbles. asic_regs
+	// registers that read, so PAL_RGB lags PAL_ADDR by one CLOCK — which
+	// still lands a dot early relative to the RGB register here, because
+	// PIXEN is one clock in four.
+	//
+	// PAL_EN low keeps the internal [KT] legacy-colour ROM below. That is
+	// the standalone-bench path (sim/plus/asic_video_test.cpp and
+	// p1_video_test_top.v elaborate this module with no asic_regs beside
+	// it); the production motherboard ties it high. Legacy PENR/INKR
+	// writes still reach the screen with PAL_EN high because asic_regs
+	// shadows them into palette entries 0-16.
+	input            PAL_EN,
+	output     [4:0] PAL_ADDR,
+	input     [11:0] PAL_RGB,
+
+	// ---- B8-5 snapshot apply (SNA v1 register file + v3 counters) ----
+	//
+	// SNA_LOAD is the shared plus_sna_apply pulse. Every input here is a
+	// SETTLED header value: the drain finished several clocks earlier, so
+	// nothing sampled on this edge can be a same-edge owner output. The
+	// registered owner reset released one clock before the pulse, so this
+	// module is out of reset while it applies.
+	//
+	// Scope note (docs/plus/b8-5-snapshot-apply-2026-09-08.md): SNA v3 does
+	// serialize the counters below, but it does NOT serialize the video
+	// pointer latches, frame/C9 parity, interlace pending events or the
+	// pixel-serializer phase. Those take an explicit deterministic seed
+	// (VMA/VMA' from the settled R12/R13, everything else its reset value);
+	// arbitrary mid-frame pixel fidelity is therefore not promised.
+	input            SNA_LOAD,
+	input      [4:0] SNA_ADDR,   // header 42: selected register index
+	// The header carries whole bytes while several CRTC registers are
+	// narrower, and R10/R11 are read-only status groups with no storage on
+	// type 3, so parts of this bus are deliberately never read.
+	/* verilator lint_off UNUSEDSIGNAL */
+	input    [143:0] SNA_REGS,   // header 43-54: R0..R17, Rn at [n*8 +: 8]
+	/* verilator lint_on UNUSEDSIGNAL */
+	input      [7:0] SNA_HCC,    // header A9: C0
+	input      [6:0] SNA_LINE,   // header AB: C4
+	input      [4:0] SNA_RASTER, // header AC: C9
+	input      [4:0] SNA_VTA,    // header AD: adjustment line index
+	input      [3:0] SNA_HSW,    // header AE: HSYNC width count
+	input      [3:0] SNA_VSW,    // header AF: VSYNC width count
+	input            SNA_VS,     // header B0 bit 0
+	input            SNA_HS,     // header B0 bit 1
+	input            SNA_ADJ,    // header B0 bit 7
+	input      [1:0] SNA_MODE    // header 40 bits 1:0, settled GA mode
+);
+
+/* verilator lint_off WIDTH */
+
+//----------------------------------------------------------------------
+// Register file
+//
+// Writes decode the full five-bit index (ACCC §28.1.9 notes reads are
+// mod-8 on types 3/4 while writes reach the selected storage register;
+// software stores into R14/R15 and reads them back through slots 6/7).
+// Select indices 10/11 (ASIC status, read-only), 16/17 (light pen) have
+// no storage here (§21.2.3 table, p.247).
+//----------------------------------------------------------------------
+
+reg  [4:0] addr;
+
+/* verilator lint_off UNUSEDSIGNAL */
+reg [7:0] R0_h_total;
+reg [7:0] R1_h_displayed;
+// R1/R2/R3 gain consumers with the display and sync phases; this scaffold
+// pragma block shrinks as each phase lands.
+/* verilator lint_off UNUSEDSIGNAL */
+reg [7:0] R2_h_sync_pos;
+reg [3:0] R3_h_sync_width;
+reg [3:0] R3_v_sync_width;
+reg [6:0] R6_v_displayed;
+reg [6:0] R7_v_sync_pos;
+reg [1:0] R8_skew;         // bits 5:4, SKEW-DISPTMG (types 0/3/4, §19.1)
+/* verilator lint_on UNUSEDSIGNAL */
+// R8 bits 1:0 select interlace modes.  Mode 3 drives the IVM counter below;
+// modes 0/1/2 retain the ordinary body-line C9 cadence. Mode 1 still seeds
+// ParityC9 on entry as required by §19.8.4; §19.6.4/§19.7.3 additionally give
+// it the CRTC3/4 even-frame line and MID-VSYNC phase.
+reg [1:0] R8_interlace;
+reg [6:0] R4_v_total;
+reg [4:0] R5_v_total_adj;
+reg [4:0] R9_v_max_line;
+// Full 8-bit storage (P5): bits 7:6 are the §20.5 (p.245) extended
+// start-address bits ("These 2 bits represent bits 14 and 15 of the video
+// pointer"). The 14-bit VMA reload below consumes R12[5:0] only; the
+// >16K carry mechanism those bits take part in is not modelled, but the
+// bits are stored and readable (§21.2.3 slot 4 returns the full register).
+reg [7:0] R12_start_addr_h;
+reg [7:0] R13_start_addr_l;
+// Cursor address (§21.2.3 slots 6/7): stored and readable on types 3/4 —
+// "it is perfectly possible to store values in these registers and then
+// read them back" (§21.2.3 note). R14 is 6-bit (bits 7:6 read 0); R15
+// full 8-bit. The cursor itself is not managed on the CPC (no CUDISP
+// consumer); only the storage exists. ACCC v1.10 supersedes [KT]'s
+// earlier "always return 0" observation for these slots.
+reg [5:0] R14_cursor_h;
+reg [7:0] R15_cursor_l;
+// Light pen (§21.2.3 slots 0/1): readable pointer registers with no
+// CPC-side strobe source. Nothing at runtime writes them; only reset and an
+// SNA header restore set them (named assumption; see the readback section).
+reg [5:0] R16_pen_h;
+reg [7:0] R17_pen_l;
+/* verilator lint_on UNUSEDSIGNAL */
+
+always @(posedge CLOCK) begin
+	if (!nRESET) begin
+		addr             <= 5'd0;
+		R0_h_total       <= 8'd0;
+		R1_h_displayed   <= 8'd0;
+		R2_h_sync_pos    <= 8'd0;
+		{R3_v_sync_width, R3_h_sync_width} <= 8'd0;
+		R4_v_total       <= 7'd0;
+		R5_v_total_adj   <= 5'd0;
+		R6_v_displayed   <= 7'd0;
+		R7_v_sync_pos    <= 7'd0;
+		{R8_skew, R8_interlace} <= 4'd0;
+		R9_v_max_line    <= 5'd0;
+		R12_start_addr_h <= 8'd0;
+		R13_start_addr_l <= 8'd0;
+		R14_cursor_h     <= 6'd0;
+		R15_cursor_l     <= 8'd0;
+		R16_pen_h        <= 6'd0;
+		R17_pen_l        <= 8'd0;
+	end
+	else if (SNA_LOAD) begin
+		// Header 42/43-54. R10/R11 are the read-only type-3 status groups
+		// (§21.2.3) and have no storage here, so their serialized bytes are
+		// deliberately dropped rather than inventing writable cursor
+		// registers. R16/R17 DO have storage (light-pen latches with no CPC
+		// strobe source), so the header seeds them.
+		addr             <= SNA_ADDR;
+		R0_h_total       <= SNA_REGS[  0 +: 8];
+		R1_h_displayed   <= SNA_REGS[  8 +: 8];
+		R2_h_sync_pos    <= SNA_REGS[ 16 +: 8];
+		{R3_v_sync_width, R3_h_sync_width} <= SNA_REGS[24 +: 8];
+		R4_v_total       <= SNA_REGS[ 32 +: 7];
+		R5_v_total_adj   <= SNA_REGS[ 40 +: 5];
+		R6_v_displayed   <= SNA_REGS[ 48 +: 7];
+		R7_v_sync_pos    <= SNA_REGS[ 56 +: 7];
+		{R8_skew, R8_interlace} <= {SNA_REGS[69:68], SNA_REGS[65:64]};
+		R9_v_max_line    <= SNA_REGS[ 72 +: 5];
+		R12_start_addr_h <= SNA_REGS[ 96 +: 8];
+		R13_start_addr_l <= SNA_REGS[104 +: 8];
+		R14_cursor_h     <= SNA_REGS[112 +: 6];
+		R15_cursor_l     <= SNA_REGS[120 +: 8];
+		R16_pen_h        <= SNA_REGS[128 +: 6];
+		R17_pen_l        <= SNA_REGS[136 +: 8];
+	end
+	else if (ENABLE & ~nCS & ~R_nW) begin
+		if (~RS) begin
+			addr <= DI[4:0];
+		end
+		else begin
+			case (addr)
+			// Writes keep the full five-bit decode (§21.2.3 truncates
+			// READS to three bits only): aliased selects 4/20 must
+			// program R4/R12 distinctly, exactly as software assumes.
+			5'd00: R0_h_total     <= DI;
+			5'd01: R1_h_displayed <= DI;
+			5'd02: R2_h_sync_pos  <= DI;
+			5'd03: {R3_v_sync_width, R3_h_sync_width} <= DI;
+			5'd04: R4_v_total     <= DI[6:0];
+			5'd05: R5_v_total_adj <= DI[4:0];
+			5'd06: R6_v_displayed <= DI[6:0];
+			5'd07: R7_v_sync_pos  <= DI[6:0];
+			5'd08: {R8_skew, R8_interlace} <= {DI[5:4], DI[1:0]};
+			5'd09: R9_v_max_line  <= DI[4:0];
+			5'd12: R12_start_addr_h <= DI;
+			5'd13: R13_start_addr_l <= DI;
+			5'd14: R14_cursor_h   <= DI[5:0];
+			5'd15: R15_cursor_l   <= DI;
+			default: ;  // 10/11 status group is read-only (§21.2.3);
+			            // 16/17 light pen has no strobe source (header)
+			endcase
+		end
+	end
+end
+
+//----------------------------------------------------------------------
+// Horizontal character counter C0 ("HCC")
+//
+// C0 counts 0..R0 inclusive (ACCC FR v1.11 §13.1 p.104). The rendered
+// type-3/4 deadline chart (§13.6.3 p.125), corroborated by real Plus SHAKER
+// A4's OUT(C) 3C/3D and OUTI 3C results, requires a late R0 rewrite not to
+// cancel the already entered terminal character. Retain that opportunity
+// until the next character edge, while still accepting live new equality.
+// This match lifetime is a model of the observed deadline, not a claim
+// about the ASIC's physical latch/storage clock. Register writes stay live.
+//
+// Outside that terminal opportunity, lowering R0 below current C0 retains
+// the equality-based eight-bit overflow assumption protected by t01e. A
+// direct type-3 lowering chronogram/hardware result is still absent; the
+// terminal-lowering control instead cites the original DSC4 AmSpirit trace.
+// §28.1.1 is not support for overflow: it concerns C4/C9 identification.
+//----------------------------------------------------------------------
+
+reg [7:0] hcc;
+
+reg         entered_terminal_match;
+wire        hcc_equal = (hcc == R0_h_total);
+wire        hcc_last = hcc_equal | entered_terminal_match;
+wire [7:0]  hcc_next = hcc_last ? 8'h00 : hcc + 8'd1;
+
+always @(posedge CLOCK) begin
+    if (!nRESET) entered_terminal_match <= 1'b1; // reset HCC=R0=0
+    // Standard SNA carries counters/registers, not in-flight match history.
+    else if (SNA_LOAD) entered_terminal_match <= (SNA_HCC == SNA_REGS[0 +: 8]);
+    else if (CLKEN) entered_terminal_match <= (hcc_next == R0_h_total);
+end
+
+always @(posedge CLOCK) begin
+	if (!nRESET) hcc <= 8'h00;
+	else if (SNA_LOAD) hcc <= SNA_HCC;   // header A9
+	else if (CLKEN) hcc <= hcc_next;
+end
+
+//----------------------------------------------------------------------
+// Vertical counters: C9 (raster line within the character row) and C4
+// (character row within the frame), plus the vertical-adjustment state.
+//
+// Vertical decisions use live registers at the line-end edge, except for
+// the retained R4 match described by MODEL LIMIT (B26) below. A write on
+// the decision edge itself is seen by the next decision in this model.
+//
+// C9/R9 completion uses ">=" not equality: on types 3/4 an R9 lowered
+// below the current C9 forces next-C9=0 with normal row accounting,
+// "it is impossible to overflow C9" (ACCC §10.3.4 p.78). Equality alone
+// is the natural case; the greater-than term is the forced reset.
+//
+// Entering adjustment from the last character row does NOT increment C4:
+// it stays equal to R4 for every adjustment line (ACCC §11.2.6 p.85),
+// and R6==R4 consequently covers those lines too (§18.2.4 note).
+// Adjustment ends when the next adjustment-line index C9+1 has reached
+// R5 — or would pass it after a mid-adjustment R5 shrink; both end the
+// management on the same line ("Whether with R5 or R9, it is impossible
+// to overflow C9", ACCC §11.3.3 p.87).
+//
+// An R4 lowered below the current C4 makes the frame-end equality
+// unreachable: C4 free-runs through its seven-bit range (ACCC §12.5
+// p.102, "overflow of the C4 counter"), in contrast to C9 above.
+//----------------------------------------------------------------------
+
+reg  [6:0] charline;
+reg  [4:0] raster;
+reg        in_adj;
+reg        interlace_line;
+reg        parity_frame;
+reg        parity_c9;
+
+wire       ivm_active    = (R8_interlace == 2'b11);
+wire       sync_interlace_active = (R8_interlace == 2'b01);
+wire       c9_done       = in_adj ? 1'b0 : (raster >= R9_v_max_line);
+// MODEL LIMIT (B26): FR §12.5 p103 and original E's 3C/3D, 38/39 and
+// ROM-shaped windows require different deadline outcomes. Retaining an
+// entered match only during a selected R4 write at consuming CLKEN is an
+// active-write inference, not a proven silicon latch. Board-shaped ENABLE
+// supplies the timing distinction; no explicit ROM decode is added here.
+// Late false-to-true matches remain live as an unverified compatibility
+// choice; generalization beyond R4->0 remains unresolved. See B26 and
+// docs/investigations/hardware-runs/shaker-crtc3-status-overflow-2026-11-06.md.
+reg        entered_r4_match;
+wire       r4_write_active = ENABLE & ~nCS & ~R_nW & RS & (addr == 5'd4);
+wire       last_charline = (charline == R4_v_total) |
+                           (hcc_last & entered_r4_match & r4_write_active);
+// The additional line follows the completed R5 block and exits directly at
+// the real frame origin (§19.6.4 p.218).  Its forced C9=0 must not re-enter
+// adjustment when R9 is also zero.
+wire       enter_adj     = ~interlace_line & c9_done & last_charline &
+                           (R5_v_total_adj != 5'd0);
+wire       adj_end_n     = ((raster + 5'd1) >= R5_v_total_adj);
+wire       body_frame_end = c9_done & last_charline &
+                            (R5_v_total_adj == 5'd0);
+
+// ACCC v1.11 FR §19.6.4 p.218 (EN p.218): either R8=3 or R8=1 gives the even frame exactly
+// one line after its R5 lines (or directly after the body when R5=0).
+// CRTC3/4 keep C4 on its last value and force C9=0 for that line. The current
+// ParityFrame is sampled before it toggles at the following real origin.
+wire       extra_line_due = (ivm_active | sync_interlace_active) &
+                             ~parity_frame;
+wire       enter_interlace_line = extra_line_due &
+                                   (body_frame_end |
+                                    (in_adj & adj_end_n));
+wire       frame_wrap = body_frame_end & ~extra_line_due;
+wire       adj_frame_wrap = in_adj & adj_end_n & ~extra_line_due;
+wire       interlace_frame_wrap = interlace_line;
+wire       frame_restart = frame_wrap | adj_frame_wrap |
+                           interlace_frame_wrap;
+
+// §19.8.4 pp.236-241: IVM advances C9 by two while retaining ParityC9.
+// Odd R9 toggles the parity at each ordinary C4 increment; a frame restart
+// instead aligns it to the newly toggled ParityFrame.  These terms are
+// deliberately IVM-gated so never-entered R8=0 counting is bit-identical
+// to the pre-IVM implementation.  On exit, the next C9<R9 seam therefore
+// resumes the documented +1 progression and the ordinary row end reloads 0.
+wire       row_parity_n = R9_v_max_line[0] ? ~parity_c9 : parity_c9;
+wire       frame_parity_n = ~parity_frame;
+wire [4:0] ivm_step = (raster + 5'd2) | {4'b0000, parity_c9};
+wire [4:0] ivm_row_reload = frame_wrap ? {4'b0000, frame_parity_n} :
+                                    enter_adj ? 5'd0 :
+                                                {4'b0000, row_parity_n};
+
+// Next-state values at the line-end edge, shared with the video-pointer
+// and display-enable logic so every consumer sees one consistent seam.
+// Adjustment end either starts the scheduled interlace line or restarts the
+// frame; only the latter changes C4/C9 to the new frame origin.
+wire [4:0] raster_n      = interlace_line ?
+                           (ivm_active ? {4'b0000, frame_parity_n} : 5'd0) :
+                           in_adj ?
+                           (adj_end_n ?
+                            (enter_interlace_line ? 5'd0 :
+                             (ivm_active ?
+                              {4'b0000, frame_parity_n} : 5'd0)) :
+                            raster + 5'd1) :
+                           c9_done ?
+                           (enter_interlace_line ? 5'd0 :
+                            (ivm_active ? ivm_row_reload : 5'd0)) :
+                           ivm_active ? ivm_step : raster + 5'd1;
+wire [6:0] charline_n    = interlace_line ? 7'd0 :
+                           (in_adj & adj_end_n) ?
+                           (enter_interlace_line ? charline : 7'd0) :
+                           in_adj ? charline :
+                           enter_adj ? charline :
+                           frame_wrap ? 7'd0 :
+                           c9_done ?
+                           (enter_interlace_line ? charline :
+                            charline + 7'd1) : charline;
+wire       adj_n         = in_adj ? !adj_end_n : enter_adj;
+wire       interlace_line_n = interlace_line ? 1'b0 :
+                              enter_interlace_line;
+
+always @(posedge CLOCK) begin
+    if (!nRESET || SNA_LOAD) entered_r4_match <= 1'b0;
+    else if (CLKEN) entered_r4_match <=
+        ((hcc_last ? charline_n : charline) == R4_v_total);
+end
+
+always @(posedge CLOCK) begin
+	if (!nRESET) begin
+		charline <= 7'd0;
+		raster   <= 5'd0;
+		in_adj   <= 1'b0;
+		interlace_line <= 1'b0;
+		parity_frame <= 1'b0;
+		parity_c9    <= 1'b0;
+	end
+	else if (SNA_LOAD) begin
+		// Headers AB/AC/AD/B0 bit 7. During vertical total adjust the
+		// serialized adjustment counter (AD) is the live index and AC is
+		// meaningless (format note 4); on types 3/4 that index lives in C9
+		// itself (ACCC §11.2.6 p.85), so it lands in `raster` either way.
+		charline       <= SNA_LINE;
+		raster         <= SNA_ADJ ? SNA_VTA : SNA_RASTER;
+		in_adj         <= SNA_ADJ;
+		// Not serialized by the format: deterministic reset seed.
+		interlace_line <= 1'b0;
+		parity_frame   <= 1'b0;
+		parity_c9      <= 1'b0;
+	end
+	else begin
+		if (CLKEN && hcc_last) begin
+			in_adj   <= adj_n;
+			interlace_line <= interlace_line_n;
+			raster   <= raster_n;
+			charline <= charline_n;
+
+			// ParityFrame runs at every real frame origin, independent of
+			// the current R8 mode (§19.5.5).  ParityC9 alignment is visible
+			// only to IVM counting, but is maintained here so a later entry
+			// starts from a well-defined frame state.
+			if (frame_restart) begin
+				parity_frame <= frame_parity_n;
+				parity_c9    <= frame_parity_n;
+			end
+			else if (ivm_active && c9_done && !enter_adj &&
+			         R9_v_max_line[0]) begin
+				parity_c9 <= row_parity_n;
+			end
+		end
+
+		// §19.8.4 p.237: changing R8 to either interlace mode seeds
+		// ParityC9 immediately from the current C9.  Decode the live bus
+		// write so this does not wait for the stored R8 NBA update.
+		if (ENABLE & ~nCS & ~R_nW & RS & (addr == 5'd8) &
+		    ((DI[1:0] == 2'b01) | (DI[1:0] == 2'b11)) &
+		    (DI[1:0] != R8_interlace)) begin
+			parity_c9 <= raster[0];
+		end
+	end
+end
+
+//----------------------------------------------------------------------
+// Video pointer: VMA (current) and VMA' (row-start latch).
+//
+// Two-stage {R12,R13} -> VMA' -> VMA behaviour, as on type 0. The ACCC
+// v1.11 §20.3.4 p.244 opening-sentence/current-pointer-model reading (the
+// later prose drops C9; hardware confirmation remains open) is used here:
+// at the frame origin C4=C9=C0=0 BOTH pointers reload from R12/R13, except
+// that VMA' keeps a screen-split capture made on the terminal line (see
+// split_held). At any other line start VMA loads from VMA'. The row-end
+// capture VMA' <- VMA fires at C0==R1 on the live row-end test
+// (row_latch_done: displayed RA >= R9 outside IVM) and is suppressed during
+// vertical adjustment, which instead re-solidifies the captured row base
+// each adjustment line ("without updating the video pointer", ACCC §11.2.6
+// p.85).
+//
+// With R1>R0 the capture can never fire, so every row re-displays the
+// frozen VMA' base — character-line repetition (ACCC §17.2.2 p.179) with
+// no spurious border substitution on types 3/4 (§17.6.2/§19.2.4).
+//----------------------------------------------------------------------
+
+reg [13:0] vma;
+reg [13:0] vma_latch;
+
+// Selected §20.3.4 frame-origin reading; see the source-conflict note above.
+wire pointer_frame_origin = (ivm_active | sync_interlace_active) ?
+                            frame_restart :
+                            (!adj_n && (charline_n == 7'd0) &&
+                             (raster_n == 5'd0));
+
+// P6: Soft scroll vertical scanline offset (SSCR[6:4], asic-reference §8)
+wire [4:0] ra_eff = {raster[4:3], (raster[2:0] + SSCR[6:4]) & 3'd7};
+
+// Row-end VMA latch update: outside IVM, a level test ra_eff >= R9 at
+// C0=R1 advances the source row, so it moves before SSCR wraps RA to 0
+// (Arnold V §2.5, asic-reference §8).  For R9 = 7 the wrapped ra_eff stays
+// in 0..7 and this is the equality test; for R9 < 7 with a nonzero offset it
+// captures on several lines of a row (original Plus probe V3 screen 25:
+// R9=3, offset 2 captures on raw rasters 1-3).  With R9 > 7 only RA's low three
+// bits wrap, and ra_eff can pass R9 on several lines of one row: R9=11,
+// offset 5 displays 5,6,7,0,1,2,3,4,13,14,15,8 and captures on raw raster
+// 8, 9 and 10, advancing three source rows per character row. Original Plus
+// probe 15 shows exactly that (rows 00,03,06,...; AmSpirit identical;
+// docs/plus/source-divergences.md). In IVM the §19.8.4 C9>=R9 decision is
+// the terminal-line test, including the even-parity overshoot line.
+wire row_latch_done = ivm_active ? c9_done : (ra_eff >= R9_v_max_line);
+wire row_latch_event = CLKEN && !in_adj && !interlace_line &&
+                       (hcc == R1_h_displayed) &&
+                       row_latch_done;
+
+// P6: Eight-bit split compare (asic-reference §8). Ordinary capture is
+// at R1. The R5=0 normal terminal line uses R0 when C4=R4 and C9=R9
+// [ARNOLD-REV §2.3]; original Plus V3 screen21 captures an SSA rewrite
+// after R1. Equality is deliberate: an R9 overshoot keeps R1 (t08l).
+wire split_match = (SPLT != 8'd0) && ({charline[4:0], raster[2:0]} == SPLT);
+// PA3: with R5>0 the last normal line keeps R1 (V4 screen28 late enable
+// misses; AmSpirit early enable captures). The actual adjustment-ending
+// line instead accepts a late enable in AmSpirit Lite1.15.1, then carries
+// SSA to frame1 onwards. R0 is the selected sampling model; the exact edge
+// and both original-Plus early/late controls remain unmeasured. Restrict
+// this added case to non-interlace: extra-line timing remains unprobed.
+// See docs/plus/source-divergences.md; t08n/t08o pin the oracle outcomes.
+wire split_adj_end = in_adj && adj_end_n &&
+                     !ivm_active && !sync_interlace_active;
+wire split_at_r0 = (last_charline && (raster == R9_v_max_line) &&
+                    !in_adj && (R5_v_total_adj == 5'd0)) ||
+                   split_adj_end;
+// last_charline retains R4 only in the terminal character; split_at_r0
+// can also be consumed outside that character. This shared use of the
+// inferred R4 deadline is not independently evidenced for screen split.
+// This capture still uses live R0. Its overlap with a late R0 rewrite
+// that ends the line through a retained terminal opportunity is unverified.
+// Original 6128 Plus V4 screen27 captures at adjustment indexes 0, 1
+// and 8 (the low-three-bit alias); adjustment must not mask the comparator.
+wire split_latch_event = CLKEN && split_match &&
+                         (hcc == (split_at_r0 ? R0_h_total : R1_h_displayed));
+
+// A split captured on the terminal line of a frame survives the frame
+// origin in VMA' while VMA still reloads from R12/R13 (original Plus probe
+// 11, SPLT=55 matching line 311 through the eight-bit compare; AmSpirit
+// identical): frame line 0 shows R12/R13, line 1 onwards SSA. VMA' priority
+// is split capture > frame-origin init > row capture. split_held remembers
+// a capture made earlier on the current line; a C0=R1=R0 capture coincides
+// with the line end under stable R0 and is seen directly.
+reg split_held;
+
+always @(posedge CLOCK) begin
+	if (!nRESET) begin
+		vma       <= 14'd0;
+		vma_latch <= 14'd0;
+		split_held <= 1'b0;
+	end
+	else if (SNA_LOAD) begin
+		// The format serializes no video-pointer state, and split history plus
+		// mid-frame R12/R13 writes make it non-unique. Both pointers therefore
+		// take the deterministic frame-origin seed from the SETTLED header
+		// R12/R13 — the same value the next real frame origin would reload.
+		vma       <= {SNA_REGS[96 +: 6], SNA_REGS[104 +: 8]};
+		vma_latch <= {SNA_REGS[96 +: 6], SNA_REGS[104 +: 8]};
+		split_held <= 1'b0;
+	end
+	else if (CLKEN) begin
+		if (split_latch_event)
+			vma_latch <= SSA;
+		else if (row_latch_event)
+			vma_latch <= vma;
+
+		if (hcc_last)               split_held <= 1'b0;
+		else if (split_latch_event) split_held <= 1'b1;
+
+		if (hcc_last) begin
+			// §20.3.4 frame-start reload has highest priority for VMA.
+			// Otherwise a simultaneous C0=R1=R0 row-end capture supplies
+			// the next row base, so do not overwrite VMA with the stale
+			// latch value on that same edge (ACCC §17.1 p.177 / §17.6.1
+			// p.186).
+			if (pointer_frame_origin) begin
+				vma <= {R12_start_addr_h[5:0], R13_start_addr_l};
+				if (!split_held && !split_latch_event)
+					vma_latch <= {R12_start_addr_h[5:0], R13_start_addr_l};
+			end
+			else if (split_latch_event) begin
+				vma <= SSA;
+			end
+			else if (!row_latch_event) begin
+				vma <= vma_latch;
+			end
+		end
+		else if (!hcc_last) begin
+			// VMA increments on every character cell processed,
+			// displayed or border (ACCC §17.1 p.177).
+			vma <= vma + 14'd1;
+		end
+	end
+end
+
+//----------------------------------------------------------------------
+// Display enable.
+//
+// Horizontal: DISPTMG on at C0=0, off from C0=R1 (ACCC §17.1 p.176).
+// The registered clear makes an R1==R0 line show exactly one border
+// character at C0=R0 (the interline blip, §17.6.1), while R1>R0 keeps
+// the whole line displayed because the equality never fires (types 3/4
+// substitute nothing, §17.6.2). R1=0 clears every line start: no
+// characters are ever displayed (§17.1/§18.3.1).
+//
+// Vertical: the R6 test runs ONLY at the beginning of a line on types
+// 3/4 — mid-line R6 updates are not considered until the next line
+// start ("The update of R6 during the line is therefore not considered",
+// ACCC §18.2.4 p.190). There is no R6==0 special case (§18.3.4). Because
+// C4 stays ==R4 through adjustment, R6==R4 borders those lines too
+// (§18.2.4 note).
+//
+// SKEW-DISPTMG (R8 bits 5:4; types 0/3/4, §19.2): 00 immediate, 01/10
+// delay both border edges by one/two characters, 11 BORDER ON (output
+// suppressed). Only the visible edges shift; pointer bookkeeping is
+// unaffected (§19.2.3 p.195).
+//----------------------------------------------------------------------
+
+reg       hde;
+reg       vde;
+reg       vde_reseed;
+reg [1:0] dde;
+
+wire      disp_raw = hde & vde;
+
+// The R6 border is a latch (ACCC v1.11 FR §18.1/§18.2.1 p.189, §18.2.4
+// p.190): it sets at a line start with C4=R6 and only the frame origin
+// clears it, so a later R6 rewrite neither cancels it nor, below C4 and
+// without equality, sets it. The origin is C4=C9=C0=0, which a C4 overflow
+// wrap also reaches without a frame end (§12.5 p.103), so the shared
+// pointer_frame_origin clears it rather than frame_restart.
+always @(posedge CLOCK) begin
+	if (!nRESET) begin
+		hde <= 1'b0;
+		vde <= 1'b0;
+		vde_reseed <= 1'b0;
+		dde <= 2'b00;
+	end
+	else if (SNA_LOAD) begin
+		// Not serialized: the display-enable phase re-derives at the next
+		// line seam from the restored counters and R1/R6.
+		hde <= 1'b0;
+		vde <= 1'b0;
+		vde_reseed <= 1'b1;
+		dde <= 2'b00;
+	end
+	else if (CLKEN) begin
+		if (hcc_last) begin
+			hde <= (R1_h_displayed != 8'd0);
+			if (pointer_frame_origin)
+				vde <= (charline_n != R6_v_displayed);
+			else if (vde_reseed)
+				vde <= (charline_n < R6_v_displayed);
+			else if (charline_n == R6_v_displayed)
+				vde <= 1'b0;
+			vde_reseed <= 1'b0;
+		end
+		else if ((hcc + 8'd1) == R1_h_displayed) begin
+			hde <= 1'b0;
+		end
+		dde <= {dde[0], disp_raw};
+	end
+end
+
+//----------------------------------------------------------------------
+// HSYNC (ACCC §14/§15).
+//
+// HSYNC starts when C0 reaches R2 and lasts R3l characters. Types 3/4
+// generate a 16-character HSYNC when R3l=0 ("it is impossible not to
+// generate HSYNC", §14.6 p.142). The width counter is a free-running
+// nibble compared against the LIVE R3l: a mid-HSYNC rewrite below the
+// already-counted value wraps the full nibble before the new equality
+// can hit, so an interrupted HSYNC never ends early (§14.5 general rule;
+// compendium-02 §4). There is no R3.JIT on types 3/4 (§14.5).
+//
+// The start comparison keys on the ENTERING edge (hcc_next == R2) so the
+// registered HSYNC is visible during character R2 itself, matching the
+// §15.2.2 chronograms where C3l=0 sits under C0=R2 — the same
+// registered-output convention the DISPTMG logic uses for C0=R1.
+//
+// Type-1..4 re-entrancy bug (§15.3.1 p.149): when C0 reaches R2 on the
+// same edge that C3 reaches R3l, the active pulse does not end. C3 keeps
+// counting through its wrapped nibble until the next equality. This is a
+// live collision, not a static register relation: §15.3.5 p.152 shows a
+// CRTC3 R2 rewrite from 11 to 21 creating the collision at the natural
+// end of an already-active pulse. The R0=0, R2=0, R3l=1 extreme makes
+// every end edge collide and therefore produces infinite HSYNC
+// (§15.3.2). ACCC §14.6 establishes that R3l=0 produces a 16-character
+// pulse, but does not say whether the §15.3 collision applies when that
+// pulse's natural end meets a live start. This model assumes it does not,
+// leaving R3l=0 bounded; that is an unverified P1 model assumption, pinned
+// by t04i pending a direct rule, Logon observation, or hardware capture.
+//----------------------------------------------------------------------
+
+reg       in_hsync;
+reg [3:0] hsc;
+reg       in_vsync;
+reg [3:0] vsc;
+reg       vsync_mid_pending;
+reg       vsync_delay_pending;
+
+wire       hsync_start               = (hcc_next == R2_h_sync_pos);
+wire [3:0] hsc_next                  = hsc + 4'd1;
+wire       hsync_end_hit             = (hsc_next == R3_h_sync_width);
+// See the unverified R3l=0 boundary assumption above: collision extension
+// is enabled only for explicit nonzero widths.
+wire       hsync_end_start_collision = (R3_h_sync_width != 4'd0) &&
+                                        hsync_start;
+
+always @(posedge CLOCK) begin
+	if (!nRESET) begin
+		HSYNC    <= 1'b0;
+		in_hsync <= 1'b0;
+		hsc      <= 4'd0;
+	end
+	else if (SNA_LOAD) begin
+		// Header B0 bit 1 + AE. The width counter is only meaningful while
+		// HSYNC is executing (format note 9), so an inactive restore starts
+		// the counter at 0 rather than carrying a stale count.
+		HSYNC    <= SNA_HS;
+		in_hsync <= SNA_HS;
+		hsc      <= SNA_HS ? SNA_HSW : 4'd0;
+	end
+	else if (CLKEN) begin
+		if (in_hsync) begin
+			hsc <= hsc_next;
+			if (hsync_end_hit && !hsync_end_start_collision) begin
+				in_hsync <= 1'b0;
+				HSYNC    <= 1'b0;
+			end
+			// else: bug path — keep the pulse asserted and let hsc roll on
+		end
+		else if (hsync_start) begin
+			in_hsync <= 1'b1;
+			HSYNC    <= 1'b1;
+			hsc      <= 4'd0;
+		end
+	end
+end
+
+//----------------------------------------------------------------------
+// VSYNC.  Outside IVM, ACCC §16.4.4 p.171 (FR §16.4.4 p.172) starts only at line starts where
+// C4==R7 AND C9==0 AND C0==0 hold simultaneously; rewriting R7 to the
+// current C4 while C0>0 does not trigger.  In IVM, FR §19.5.5 pp.214-216
+// (EN pp.214-216) and FR §19.7.3 p.219 (EN p.219) move the even-frame start to C0=R0/2 on the first line of
+// C4=R7.  On an odd frame with odd R9 and odd R7, the start is delayed to
+// the following line.  The R7=0 priority exception naturally samples the
+// outgoing ParityFrame here because frame_restart and the parity NBA share
+// the same edge: outgoing even schedules MID-VSYNC in the new odd frame;
+// outgoing odd starts a seam pulse in the new even frame.
+//
+// There is no re-entrancy protection — a condition that persists across a
+// finished pulse restarts it immediately. Width is R3h lines with 0 meaning
+// 16 (§14.2).  §16.1 p.160 advances that line count at C0=0: MID-VSYNC
+// changes the pulse's start only, not the C3h count phase.  Dynamic R3h
+// rewrites follow the CRTCs-0/3/4 rule (compendium-02 §2).  The ASIC needs
+// >=3 active lines to emit monitor C-VSYNC, which belongs to the integrated
+// pipeline phase.
+//----------------------------------------------------------------------
+
+// `charline_n`/`raster_n` preserve the original type-3 condition on every
+// seam exposing C4=R7,C9=0, including entry into R5 and the interlace line.
+// IVM can also begin a C4 on odd C9, so the true new-C4 seam is an additional
+// target even when raster_n!=0.  Only that new-C4 case is eligible for the
+// odd-frame/odd-C4 one-line delay; R5/interlace-line refires retain the
+// ordinary seam condition unless MID-VSYNC moves them to R0/2.
+wire        vsync_new_c4_start = hcc_last &&
+                                  (frame_restart ||
+                                   (!in_adj && !interlace_line && c9_done &&
+                                    !last_charline));
+wire        vsync_new_c4_target = vsync_new_c4_start &&
+                                   (charline_n == R7_v_sync_pos);
+wire        vsync_zero_target = hcc_last &&
+                                 (charline_n == R7_v_sync_pos) &&
+                                 (raster_n == 5'd0);
+wire        vsync_target_seam = vsync_new_c4_target | vsync_zero_target;
+// ACCC v1.11 FR §19.7.3 p.219 (EN p.219): on CRTC3/4 either R8=3 or R8=1 moves VSYNC to
+// C0=R0/2 when the target C4 belongs to the even ParityFrame. Reuse the
+// established outgoing-parity phase so the R7=0 priority rule stays intact.
+wire        vsync_mid_schedule = vsync_target_seam &&
+                                  (ivm_active || sync_interlace_active) &&
+                                  !parity_frame;
+wire        vsync_delay_schedule = vsync_new_c4_target && ivm_active &&
+                                    parity_frame && R9_v_max_line[0] &&
+                                    R7_v_sync_pos[0];
+wire [7:0]  vsync_half_hcc = {1'b0, R0_h_total[7:1]};
+wire        vsync_half_tick = (hcc_next == vsync_half_hcc);
+wire        vsync_mid_fire = (ivm_active || sync_interlace_active) &&
+                              (vsync_mid_pending | vsync_mid_schedule) &&
+                              vsync_half_tick;
+wire        vsync_delay_fire = ivm_active && vsync_delay_pending && hcc_last;
+wire        vsync_seam_fire = vsync_target_seam &&
+                               !vsync_mid_schedule &&
+                               !vsync_delay_schedule;
+wire        vsync_fire = vsync_seam_fire | vsync_mid_fire |
+                          vsync_delay_fire;
+wire [3:0]  vsc_next        = vsc + 4'd1;
+wire        vsync_width_hit = (vsc_next == R3_v_sync_width);
+wire        vsync_count_tick = hcc_last;
+
+// Latch the first-line decision at its seam.  Reading parity only at the
+// later half-line would be wrong for R7=0, because ParityFrame has toggled by
+// then (§19.7.3).  The delay latch is consumed at the next line seam.
+always @(posedge CLOCK) begin
+	if (!nRESET) begin
+		vsync_mid_pending   <= 1'b0;
+		vsync_delay_pending <= 1'b0;
+	end
+	else if (SNA_LOAD) begin
+		// Interlace pending events are not serialized: deterministic clear.
+		vsync_mid_pending   <= 1'b0;
+		vsync_delay_pending <= 1'b0;
+	end
+	else if (CLKEN) begin
+		if (!ivm_active && !sync_interlace_active) begin
+			vsync_mid_pending   <= 1'b0;
+			vsync_delay_pending <= 1'b0;
+		end
+		else begin
+			if (vsync_mid_fire)
+				vsync_mid_pending <= 1'b0;
+			else if (vsync_target_seam)
+				vsync_mid_pending <= vsync_mid_schedule;
+
+			if (vsync_delay_fire)
+				vsync_delay_pending <= 1'b0;
+			else if (vsync_target_seam)
+				vsync_delay_pending <= vsync_delay_schedule;
+		end
+	end
+end
+
+// The width counts LINE boundaries while the pulse is active (R3h is a
+// line count), and a condition that persists across the expiring edge
+// renews the pulse on that same edge — there is no re-entrancy
+// protection, so with R7=R4=R9=0 the pin never visibly drops (§16.4.4).
+always @(posedge CLOCK) begin
+	if (!nRESET) begin
+		VSYNC    <= 1'b0;
+		in_vsync <= 1'b0;
+		vsc      <= 4'd0;
+	end
+	else if (SNA_LOAD) begin
+		// Header B0 bit 0 + AF, same "only meaningful while executing" rule
+		// as HSYNC above (format note 8).
+		VSYNC    <= SNA_VS;
+		in_vsync <= SNA_VS;
+		vsc      <= SNA_VS ? SNA_VSW : 4'd0;
+	end
+	else if (CLKEN) begin
+		if (in_vsync) begin
+			if (vsync_count_tick) begin
+				vsc <= vsc_next;
+				if (vsync_width_hit) begin
+					if (vsync_fire) begin
+						vsc <= 4'd0;   // renewed without a gap
+					end
+					else begin
+						in_vsync <= 1'b0;
+						VSYNC    <= 1'b0;
+					end
+				end
+			end
+		end
+		else if (vsync_fire) begin
+			in_vsync <= 1'b1;
+			VSYNC    <= 1'b1;
+			vsc      <= 4'd0;
+		end
+	end
+end
+
+assign DE = (R8_skew == 2'b00) ? disp_raw :
+            (R8_skew == 2'b01) ? dde[0] :
+            (R8_skew == 2'b10) ? dde[1] : 1'b0;
+
+assign HCC  = hcc;
+assign LINE = charline;
+assign ROW  = raster;
+assign ADJ  = in_adj;
+// B8-2 selected-field ownership (ACCC v1.11 FR §19.5.5 pp.214-216,
+// EN pp.214-216; FR §19.6.4 p.218; FR §19.7.3 p.219): ParityFrame toggles
+// every frame whatever R8, and either interlace mode (R8=1 or 3) schedules
+// the additional line and the MID-VSYNC on the ParityFrame-even frame,
+// except R7=0 which samples the OUTGOING parity (so MID then carries the
+// opposite FIELD; FIELD itself is never inverted by R7). FIELD is therefore
+// 1 on the even field and 0 on the odd field for ordinary R7, and 0
+// constantly when progressive. Polarity is a SOURCE-DERIVED MiSTer
+// convention from sys/ascal.vhd:1233-1252 (FIELD1 writes the first woven
+// line, FIELD0 the one-line-offset line; settled even-R9 IVM aligns C9
+// parity to frame parity): it is not hardware-measured ASCAL clearance, and
+// the classic FIELD=~field resemblance (separate legacy flop) is not
+// evidence. Transition C9/frame mismatch after an odd-C9 entry is real per
+// FR §19.5.5 p.214: FIELD follows frame parity, not raster parity.
+// Combinational from the frame-origin flop, so it is stable across the
+// mid-frame C4=R7 VSYNC it qualifies.
+assign FIELD = ~parity_frame & R8_interlace[0];
+assign MA   = vma;
+// P6: Soft scroll vertical scanline offset (SSCR[6:4], asic-reference §8)
+assign RA   = ra_eff;
+
+//----------------------------------------------------------------------
+// P5: register readback, status groups (ACCC §21.2.3 p.247, FR p.246, §21.3.4
+// pp.249-250, FR pp.248-249).
+//
+// Reads decode ONLY the three least significant bits of the selected
+// register number through the fixed map
+//   {R16, R17, STATUS1, STATUS2, R12, R13, R14, R15}
+// ("Reading R4 therefore also means reading register 12", §21.2.3;
+// §21.3.4's note that "bit 3 of the register number is forced to 1"
+// describes the same truncation for slots 2/3). Writes keep the full
+// five-bit decode. The two documented read ports (&BE00/&BF00) differ
+// only in RS (A8); type 3 ignores RS while reading, so both return the
+// selected register (§21.2.3). DO is HIGH-NEUTRAL (wired-AND) whenever
+// this module does not answer, the same open-bus convention as asic_regs.
+//
+// [KT] (cpctech cpcplus.html, CRTC section) first published this map
+// with slots 6/7 returning 0; ACCC v1.10 §21.2.3 supersedes that with
+// stored, writable R14/R15. R12 reads return all eight stored bits:
+// bits 7:6 are the §20.5 (p.245) extended start-address bits, kept for
+// readback while the VMA reload consumes R12[5:0] only.
+//
+// Status comparisons remain live: FR §21.3.4.1–2 pp.248–249 and
+// §28.1.10 p.293 (S1.0 is zero otherwise). They are distinct from the
+// retained terminal opportunity used by the counter/event consumers.
+// STATUS 1 (slot 2) and STATUS 2 (slot 3) are live combinational levels
+// of the counter/pointer state — several bits hold for one character
+// only (§21.3.4 "requires great precision"). The HSYNC/VSYNC boundary
+// boundaries follow the literal §21.3.4 comparators. In particular STATUS1
+// bit 4 is low at C0=R2+R3l; unlike HSYNC pulse generation, that comparator
+// does not substitute 16 for R3l=0. Bit 5 has opposite event polarity at
+// R3h=0 (FR §21.3.4.1 p.248): fifteen HIGH lines from VSYNC, LOW outside
+// that band, as checked by original DU03C0's 297 LOW / 15 HIGH reads.
+//
+// Named assumptions (each would need its own vector against new
+// evidence):
+//  - Status 1 bit 5 uses live R3h even for mid-VSYNC writes; the status
+//    readback transition for those writes is not independently evidenced.
+//  - R16/R17 change only at reset or SNA restore: no light-pen strobe
+//    source is emulated.
+//  - Status 2 bit 3 resets to 0 and toggles at every 16th frame origin
+//    (§21.3.4.2 "Timer 16 CRTC frames"; §28.1.10 p.294 notes this bit
+//    differs between CRTC 3 and CRTC 4 — type 3 only here).
+//  - Writes to selects 16+ are ignored (ACCC documents read truncation
+//    only; aliased-select write behaviour is not evidenced).
+//----------------------------------------------------------------------
+
+// STATUS 1 (ACCC FR §21.3.4.1 p.248): horizontal-event group.
+wire s1_bit0 = hcc_equal;                                    // 1 at C0=R0
+wire s1_bit1 = ~(hcc == {1'b0, R0_h_total[7:1]});           // 0 at C0=R0/2
+wire s1_bit2 = ~((R0_h_total >= R1_h_displayed) &&
+                 (hcc == (R1_h_displayed - 8'd1)));         // 0 at C0=R1-1
+wire s1_bit3 = ~(hcc == R2_h_sync_pos);                     // 0 at C0=R2
+wire [8:0] status1_hsync_end = {1'b0, R2_h_sync_pos} +
+                               {5'd0, R3_h_sync_width};
+wire s1_bit4 = ~(hcc == status1_hsync_end);                 // 0 at C0=R2+R3l
+// FR §21.3.4.1 p248 gives opposite event polarity at R3h=0:
+// fifteen HIGH lines, LOW outside that band (original DU03C0 check).
+wire s1_bit5 = (R3_v_sync_width == 0) ?
+                 (in_vsync && (vsc != 4'd15)) :
+                 ~(in_vsync && (vsc == (R3_v_sync_width - 4'd1)));
+// C0=0..R0-1 with VMA LSB 0xFF, or C0=R0 with VMA' LSB 0x00: the next
+// character resets the video-pointer low byte (§21.3.4.1 prose).
+wire s1_bit7 = ~(((hcc != R0_h_total) && (vma[7:0] == 8'hFF)) ||
+                 ((hcc == R0_h_total) && (vma_latch[7:0] == 8'h00)));
+
+// STATUS 2 (ACCC FR §21.3.4.2 p.249): vertical-event group.
+// MODEL LIMIT (B26): canonical physical CRTC3 DU03C0 OK, bound to unchanged
+// SHAKER26/27 predicates, establishes the normal39*8 and adjusted38*8+8 pair:
+// bit0 pulses at the body end, not again in adjustment. FR §11.2.6 pp.85–86
+// gives C9 to R5 there. Qualifying this strict comparator by !in_adj matches
+// that observable; comparator topology, live writes, interlace and other
+// status bits remain unproved. Ordinary extra-interlace-line behavior is
+// unchanged. See docs/investigations/hardware-runs/
+// shaker-crtc3-status-overflow-2026-11-06.md.
+wire s2_bit0 = ~(!in_adj && (charline == R4_v_total) &&
+                 (raster == R9_v_max_line) && hcc_equal);
+wire s2_bit1 = ~((charline == (R6_v_displayed - 7'd1)) &&
+                 (raster == R9_v_max_line) && hcc_equal);
+wire s2_bit2 = ~((charline == (R7_v_sync_pos - 7'd1)) &&
+                 (raster == R9_v_max_line) && hcc_equal);
+wire s2_bit3 = frame16_toggle;
+// MODEL LIMIT (B26): canonical physical CRTC3 DU OK and unchanged SHAKE26/27
+// predicates support bit4 HIGH throughout normal R4/R5=38/0, but only at the
+// final character of adjusted37/8. This bounded observation overrides FR
+// §21.3.4.2 p.249's "Always 1" row. Reusing adjustment termination matches
+// those samples; it does not prove decoder topology. End of adjustment versus
+// true frame origin, extra interlace lines and live R5/R0 writes are unmeasured.
+// See docs/investigations/hardware-runs/
+// shaker-crtc3-status-overflow-2026-11-06.md.
+wire s2_bit4 = (R5_v_total_adj == 5'd0) ||
+                 (in_adj && adj_end_n && hcc_equal);
+wire s2_bit5 = ~(raster == R9_v_max_line);
+wire s2_bit7 = ((raster == R9_v_max_line) && hcc_equal) ||
+               ((raster == 5'd0) && (hcc != R0_h_total));
+
+// Frame-origin strobe: the same edge the video pointers reload from
+// R12/R13 (C4=C9=C0, §20.3.4 p.244, FR p.243).
+reg  [3:0] frame16_cnt;
+reg        frame16_toggle;
+wire frame_origin = CLKEN && hcc_last && pointer_frame_origin;
+
+always @(posedge CLOCK) begin
+	if (!nRESET) begin
+		frame16_cnt    <= 4'd0;
+		frame16_toggle <= 1'b0;
+	end
+	else if (SNA_LOAD) begin
+		// STATUS2 bit 3's 16-frame timer is not serialized: deterministic seed.
+		frame16_cnt    <= 4'd0;
+		frame16_toggle <= 1'b0;
+	end
+	else if (frame_origin) begin
+		if (frame16_cnt == 4'd15) begin
+			frame16_cnt    <= 4'd0;
+			frame16_toggle <= ~frame16_toggle;
+		end
+		else begin
+			frame16_cnt <= frame16_cnt + 4'd1;
+		end
+	end
+end
+
+always @(*) begin
+	DO = 8'hFF;
+	if (ENABLE & ~nCS & R_nW) begin
+		case (addr[2:0])
+			3'd0: DO = {2'b00, R16_pen_h};
+			3'd1: DO = R17_pen_l;
+			3'd2: DO = {s1_bit7, 1'b1, s1_bit5, s1_bit4,
+			            s1_bit3, s1_bit2, s1_bit1, s1_bit0};
+			3'd3: DO = {s2_bit7, 1'b0, s2_bit5, s2_bit4,
+			            s2_bit3, s2_bit2, s2_bit1, s2_bit0};
+			3'd4: DO = R12_start_addr_h;
+			3'd5: DO = R13_start_addr_l;
+			3'd6: DO = {2'b00, R14_cursor_h};
+			3'd7: DO = R15_cursor_l;
+		endcase
+	end
+end
+
+//----------------------------------------------------------------------
+// Locked-ASIC pixel path (P1 remainder).
+//
+// Contract: one video word per character arrives on VIDEOD; the even byte
+// is displayed during dots 0-7 and the odd byte during dots 8-15. Within
+// each byte half the documented nibble/bit groups are emitted leftmost
+// first at the mode-dependent rate:
+//   mode 0 (%00): 2 px/half, 4 dots each, pen = {b1,b5,b3,b7} then
+//                 {b0,b4,b2,b6}          (Grimware "Byte/Pixel structure";
+//                 == netlist cidx taps {r1,r5,r3,r7} / post-shift state)
+//   mode 1 (%01): 4 px/half, 2 dots each, pens {b3,b7} {b2,b6} {b1,b5}
+//                 {b0,b4}                (== netlist taps {r3,r7} family)
+//   mode 2 (%10): 8 px/half, 1 dot each,  bit b7 first
+//                 (== netlist tap r7)
+//   mode 3 (%11): 2 px/half, 4 dots each, pens {b3,b7} then {b2,b6}
+//                 (Grimware documents this layout for the undocumented
+//                 VM=3; the netlist decodes it through the mode-1 mux)
+// Pens select INKR_I entries (mode 2 uses only inks 0/1); outside DE the
+// border colour is substituted; RGB is forced to black while HSYNC is
+// active — the netlist FORCE_BLANK analogue (video.sv FORCE_BLANK term).
+// The vertical-blank region blanking of ga40010 (HCNTLT28) needs the
+// monitor-side timing that lands with motherboard integration.
+//
+// P1/Pre-P6 pixel pipeline contract (validated by p1_video and motherboard benches):
+// the first pixel of a character's even byte is presented on dot 0 and
+// RGB is registered once per dot (one-dot presentation latency). The
+// registered output and de_hold capture reproduce the documented Plus GA
+// emulation pipeline latency (INKR effects at ~1/4-1/2 character per [KT]
+// and Grimware timings).
+//----------------------------------------------------------------------
+
+reg  [3:0] pix_cnt;    // dot index within the character (0..15)
+reg  [7:0] vid_even;   // byte displayed during dots 0-7
+reg  [7:0] vid_odd;    // byte displayed during dots 8-15
+reg        de_hold;    // DE captured at the character edge (post-skew)
+reg  [1:0] mode_q;     // GAMODE latched on the qualified GA event
+
+always @(posedge CLOCK) begin
+	if (!nRESET) pix_cnt <= 4'd0;
+	else if (SNA_LOAD) pix_cnt <= 4'd0;   // serializer phase not serialized
+	else if (PIXEN) pix_cnt <= CLKEN ? 4'd0 : (pix_cnt + 4'd1);
+end
+
+// Byte latches mirror ga40010's twice-per-character VIDEO_BUF capture.
+always @(posedge CLOCK) begin
+	if (!nRESET) begin
+		vid_even <= 8'd0;
+		vid_odd  <= 8'd0;
+		de_hold  <= 1'b0;
+	end
+	else if (SNA_LOAD) begin
+		// Pending byte latches discarded: pre-restore fetches must not escape
+		// after resume.
+		vid_even <= 8'd0;
+		vid_odd  <= 8'd0;
+		de_hold  <= 1'b0;
+	end
+	// Each half must be latched on the edge BEFORE the first dot that
+	// displays it: the even byte at the CLKEN edge that resets pix_cnt to
+	// 0, the odd byte at the edge that ends dot 7. Latching the odd byte
+	// at pix_cnt==8 instead leaves dot 8 showing the previous character's
+	// odd byte, which is invisible whenever VIDEOD is held constant (t05h).
+	else if (PIXEN) begin
+		if (CLKEN) begin
+			vid_even <= VIDEOD[7:0];
+			de_hold  <= DE;
+		end
+		else if (pix_cnt == 4'd7) begin
+			vid_odd <= VIDEOD[15:8];
+		end
+	end
+end
+
+// ACCC v1.11 FR §§9.3.1–9.3.3 pp.52–53: a valid >=2us HSYNC
+// qualifies the requested mode in the ASIC's delayed GA window. The GA
+// owns that event; raw HSYNC assertion cannot establish either condition.
+// Consume on CLOCK, not PIXEN: the supplied event is one master clock.
+// Type3's exact mixed-byte transition pixel remains open (§9.3.4.1 p.54).
+always @(posedge CLOCK) begin
+	if (!nRESET) mode_q <= 2'b00;
+	else if (SNA_LOAD) begin
+		// The settled header owns the decoder while the GA restores its
+		// shadow on this same edge; sampling GAMODE would read old state.
+		mode_q <= SNA_MODE;
+	end
+	else if (MODE_UPDATE_EN) mode_q <= GAMODE;
+end
+
+wire [7:0] vbyte = pix_cnt[3] ? vid_odd : vid_even;
+wire [2:0] s     = pix_cnt[2:0];
+
+reg [3:0] pen_nib;
+always @(*) begin
+	case (mode_q)
+		// Mode 0: leftmost pixel takes the odd bits, second the even bits
+		// (Grimware bit row A0 B0 A2 B2 A1 B1 A3 B3 => A={A3,A2,A1,A0}).
+		2'b00: pen_nib = s[2] ? {vbyte[0], vbyte[4], vbyte[2], vbyte[6]}
+		                      : {vbyte[1], vbyte[5], vbyte[3], vbyte[7]};
+		// Mode 1: pairs {b3,b7} {b2,b6} {b1,b5} {b0,b4}, two dots per pen;
+		// pixel p takes high bit b(3-p) and low bit b(7-p).
+		2'b01: pen_nib = {vbyte[{1'b0, ~s[2], ~s[1]}],
+		                  vbyte[{1'b1, ~s[2], ~s[1]}]};
+		// Mode 2: sequential bits, MSB first, one dot per pen.
+		2'b10: pen_nib = {3'b000, vbyte[~s]};
+		// Mode 3 (Grimware): {b3,b7} then {b2,b6}, four dots per pen.
+		2'b11: pen_nib = s[2] ? {2'b00, vbyte[2], vbyte[6]}
+		                      : {2'b00, vbyte[3], vbyte[7]};
+	endcase
+end
+
+// [KT] measured legacy-colour table (Palette section): hardware colour
+// number -> {R,G,B} nibbles, mid level = 6. Verified entry-by-entry
+// against the ga40010 netlist DAC equations during P1 extraction.
+function [11:0] legacy_colour(input [4:0] hw);
+	begin
+		case (hw)
+			5'd00: legacy_colour = {4'd6,  4'd6,  4'd6 };
+			5'd01: legacy_colour = {4'd6,  4'd6,  4'd6 };
+			5'd02: legacy_colour = {4'd0,  4'd15, 4'd6 };
+			5'd03: legacy_colour = {4'd15, 4'd15, 4'd6 };
+			5'd04: legacy_colour = {4'd0,  4'd0,  4'd6 };
+			5'd05: legacy_colour = {4'd15, 4'd0,  4'd6 };
+			5'd06: legacy_colour = {4'd0,  4'd6,  4'd6 };
+			5'd07: legacy_colour = {4'd15, 4'd6,  4'd6 };
+			5'd08: legacy_colour = {4'd15, 4'd0,  4'd6 };
+			5'd09: legacy_colour = {4'd15, 4'd15, 4'd6 };
+			5'd10: legacy_colour = {4'd15, 4'd15, 4'd0 };
+			5'd11: legacy_colour = {4'd15, 4'd15, 4'd15};
+			5'd12: legacy_colour = {4'd15, 4'd0,  4'd0 };
+			5'd13: legacy_colour = {4'd15, 4'd0,  4'd15};
+			5'd14: legacy_colour = {4'd15, 4'd6,  4'd0 };
+			5'd15: legacy_colour = {4'd15, 4'd6,  4'd15};
+			5'd16: legacy_colour = {4'd0,  4'd0,  4'd6 };
+			5'd17: legacy_colour = {4'd0,  4'd15, 4'd6 };
+			5'd18: legacy_colour = {4'd0,  4'd15, 4'd0 };
+			5'd19: legacy_colour = {4'd0,  4'd15, 4'd15};
+			5'd20: legacy_colour = {4'd0,  4'd0,  4'd0 };
+			5'd21: legacy_colour = {4'd0,  4'd0,  4'd15};
+			5'd22: legacy_colour = {4'd0,  4'd6,  4'd0 };
+			5'd23: legacy_colour = {4'd0,  4'd6,  4'd15};
+			5'd24: legacy_colour = {4'd6,  4'd0,  4'd6 };
+			5'd25: legacy_colour = {4'd6,  4'd15, 4'd6 };
+			5'd26: legacy_colour = {4'd6,  4'd15, 4'd0 };
+			5'd27: legacy_colour = {4'd6,  4'd15, 4'd15};
+			5'd28: legacy_colour = {4'd6,  4'd0,  4'd0 };
+			5'd29: legacy_colour = {4'd6,  4'd0,  4'd15};
+			5'd30: legacy_colour = {4'd6,  4'd6,  4'd0 };
+			5'd31: legacy_colour = {4'd6,  4'd6,  4'd15};
+			default: legacy_colour = 12'h000;
+		endcase
+	end
+endfunction
+
+// P6: Soft scroll horizontal delay line (SSCR[3:0]) and border mask (SSCR[7]).
+reg [3:0] pen_delay [0:14];
+integer p_idx;
+always @(posedge CLOCK) begin
+	if (!nRESET) begin
+		for (p_idx = 0; p_idx < 15; p_idx = p_idx + 1)
+			pen_delay[p_idx] <= 4'd0;
+	end
+	else if (SNA_LOAD) begin
+		// Soft-scroll delay line holds pre-restore pens: discard.
+		for (p_idx = 0; p_idx < 15; p_idx = p_idx + 1)
+			pen_delay[p_idx] <= 4'd0;
+	end
+	else if (PIXEN) begin
+		pen_delay[0] <= pen_nib;
+		for (p_idx = 1; p_idx < 15; p_idx = p_idx + 1)
+			pen_delay[p_idx] <= pen_delay[p_idx - 1];
+	end
+end
+
+wire [3:0] pen_delayed = (SSCR[3:0] == 4'd0) ? pen_nib : pen_delay[SSCR[3:0] - 4'd1];
+
+// Tracks the first character of active display on each line for SSCR[7] border masking.
+reg de_first_char;
+always @(posedge CLOCK) begin
+	if (!nRESET) begin
+		de_first_char <= 1'b0;
+	end
+	else if (SNA_LOAD) begin
+		de_first_char <= 1'b0;
+	end
+	else if (PIXEN && CLKEN) begin
+		de_first_char <= (!de_hold && DE) || (hcc_last && DE);
+	end
+end
+
+wire eff_de   = de_hold & ~(SSCR[7] & de_first_char);
+wire [4:0] hw_sel  = eff_de ? INKR_I[pen_delayed*5 +: 5] : BORDER_I;
+
+// Palette entry for this dot: the decoded pen inside active display, entry
+// 16 (border) outside it (asic-reference §6).
+assign PAL_ADDR = eff_de ? {1'b0, pen_delayed} : 5'd16;
+
+// asic_regs stores the word as {G,R,B}; this pipeline carries {R,G,B}.
+wire [11:0] asic_rgb = {PAL_RGB[7:4], PAL_RGB[11:8], PAL_RGB[3:0]};
+
+wire [11:0] rgb_mux = PAL_EN ? asic_rgb : legacy_colour(hw_sel);
+// Horizontal blank is aligned to the registered pixel stream. The 15-dot
+// output offset is a measured AmSpirit Lite1.17.1 Type3 software reference
+// (normal-boot Mode1/2 controls), not a verified silicon delay. ACCC French
+// v1.11 §14.7.2 p144 explicitly qualifies its Type3 chronogram as a working
+// assumption. Evidence/limits: docs/investigations/hardware-runs/
+// asic-credit-blank-boundary-2026-11-04.md#normal-boot-reference-controls. Raw HSYNC and its mode/IRQ
+// consumers retain their original timing; only the final RGB mask is delayed.
+reg [14:0] horizontal_blank_history;
+always @(posedge CLOCK) begin
+    if (!nRESET) horizontal_blank_history <= 15'd0;
+    // Pixel history is not serialized. Normalize to the settled incoming pin
+    // (HSYNC itself updates on this edge), discarding old pending transitions.
+    // Seeding from old HSYNC or zero would leak color on an active-HS restore.
+    else if (SNA_LOAD) horizontal_blank_history <= {15{SNA_HS}};
+    else if (PIXEN) horizontal_blank_history <= {horizontal_blank_history[13:0], HSYNC};
+end
+wire        blank = horizontal_blank_history[14];
+
+// Line seam strobe for the sprite engine: the character-counter wrap edge.
+assign HWRAP = CLKEN & hcc_last;
+
+// Final precedence (asic-reference §5): HSYNC force-blank beats
+// everything; the border beats sprites, including SSCR[7]'s extension over
+// the first character (Arnold V §2.5 "causes the border to extend", §2.1
+// border > sprites); a sprite pixel beats the decoded screen ink inside DE.
+// SPR_RGB carries {R,G,B} nibbles.
+wire show_spr = eff_de & SPR_EN;
+
+always @(posedge CLOCK) begin
+	if (!nRESET) begin
+		RGB_R <= 4'h0;
+		RGB_G <= 4'h0;
+		RGB_B <= 4'h0;
+		PEN   <= 5'd0;
+	end
+	else if (SNA_LOAD) begin
+		RGB_R <= 4'h0;
+		RGB_G <= 4'h0;
+		RGB_B <= 4'h0;
+		PEN   <= 5'd0;
+	end
+	else if (PIXEN) begin
+		PEN   <= {~eff_de, pen_delayed};
+		RGB_R <= blank    ? 4'h0 :
+		         show_spr ? SPR_RGB[11:8] : rgb_mux[11:8];
+		RGB_G <= blank    ? 4'h0 :
+		         show_spr ? SPR_RGB[7:4]  : rgb_mux[7:4];
+		RGB_B <= blank    ? 4'h0 :
+		         show_spr ? SPR_RGB[3:0]  : rgb_mux[3:0];
+	end
+end
+
+endmodule

@@ -1,0 +1,897 @@
+//============================================================================
+//  Amstrad Plus ASIC (AMS40489) — locked-ASIC Gate Array support path:
+//  bus sequencer, CPU/memory strobes, sync filtering and interrupt
+//  generation, and the legacy Gate Array register file.
+//
+//  Architecture role (docs/plus/architecture.md §2/§5 Risk 1, decision
+//  recorded 2026-08-24): in Plus mode the Z80/SDRAM timing contract that the
+//  classic path receives from the ga40010 netlist is reproduced HERE,
+//  behaviourally, so no netlist-derived Gate Array personality runs in the
+//  Plus path. Rasterisation itself lives in rtl/plus/asic_video.v; this
+//  module provides everything else ga40010 provided: the 16 MHz sequencer,
+//  CCLK/PHI/READY/RAS/CAS generation, the monitor-side sync shaper, the
+//  52-line interrupt counter, and the legacy GA registers (INKR/BORDER/RMR)
+//  that drive asic_video's GAMODE/BORDER_I/INKR_I inputs.
+//
+//  The state machines follow the published Gate Array timing description in
+//  "40010 simplified" V03 by Gerald (as does rtl/GA40010/ga40010.sv); this
+//  is an independent synchronous expression written for the Plus stream,
+//  licensed like its source. The differential bench
+//  sim/plus/asic_ga_timing_diff_test.cpp compares the common bus/sync path
+//  against ga40010. Its raw-counter equivalence assumptions do not hold
+//  for the delayed-count model below and remain an explicit failing gate.
+//  Plus compatible delivery and DMA-ACK retention are checked against
+//  Plus hardware separately. Register payload decoding (border/INKR/mode/
+//  ROM mapping) also has directed vectors because ga40010 does not export
+//  those registers for comparison.
+//
+//  Technical information sourced from the "Amstrad CPC CRTC Compendium"
+//  by Longshot (CC BY-NC-ND 4.0).
+//
+//  Deliberate differences from ga40010:
+//   - MODEL LIMIT (B26): compatible normal counting uses delayed HSYNC,
+//     with prompt normal-wrap delivery; non-normal causes retain the
+//     existing next-character delivery. DMA ACK retains compatible requests.
+//     PA7 V5/overlap photographs constrain outcomes, not this internal split.
+//     See docs/investigations/hardware-runs/
+//     shaker-crtc3-br-delayed-count-2026-11-06.md and B26.
+//   - Snapshot (SNA) preload covers more than ga40010's: besides the register
+//     file it seeds the sync/interrupt phase from the v3 header (B8-5).
+//     Power-up values are defined constants rather than uninitialised
+//     storage: border resets to 5'b10000 and RMR to 0 exactly as ga40010
+//     resets them, and INKR entries plus ink select carry an explicit RTL
+//     reset to 0 (ga40010 leaves those to FPGA power-up init); the
+//     INKR/ink-select power-up value is a named unverified model assumption
+//     (real ASIC power-up contents undocumented).
+//   - Graphic-mode qualification follows the ASIC's delayed window; the
+//     reference MODE_SYNC_EN and all sync/IRQ outputs keep their own timing.
+//   - No video-buffer/RGB section: asic_video owns rasterisation.
+//   - No DISPEN input: only the omitted video buffer consumed it.
+//   - No ``ifdef VERILATOR`` shadow domain: the *_sync variants this module
+//     mirrors are already fully synchronous.
+//============================================================================
+
+module asic_ga_timing
+(
+	input        clk,
+	input        cen_16,    // 16 MHz dot-clock enable (64 MHz / 4)
+	input        fast,      // CPU won't WAIT speed hack (OSD no_wait)
+
+	input        RESET_N,
+
+	// Authoritative Plus ASIC lock state from plus_mmu.  A locked 101xxxxx
+	// write is the legacy MRER alias; once unlocked it belongs exclusively to
+	// RMR2 and must not update mode, ROM enables, or the IRQ-clear bit.
+	// Source: docs/plus/references/asic-reference.md sections 1-2; the classic
+	// MRER bit-5 don't-care is also tabulated in
+	// docs/references/Amstrad CPC Gate-Array.md, "Rom configuration selection".
+	input        plus_unlocked,
+
+	// Z80 bus (chip-side view, same signals ga40010 samples). D[5] is
+	// genuinely undecoded, exactly as in the reference.
+	/* verilator lint_off UNUSEDSIGNAL */
+	input [15:14] A,
+	input [7:0]  D,
+	/* verilator lint_on UNUSEDSIGNAL */
+	input        MREQ_N,
+	input        M1_N,
+	input        RD_N,
+	input        IORQ_N,
+
+	// CRTC type-3 raster inputs (asic_video outputs)
+	input        HSYNC_I,
+	input        VSYNC_I,
+
+	// ---- Bus/clock contract (mirrors ga40010 outputs consumed by the
+	// motherboard: T80pa enables/wait, VRAM fetch block, crt_filter CE) ----
+	output       CCLK,
+	output       CCLK_EN_P,
+	output       CCLK_EN_N,
+	output reg   PHI_N,
+	output       PHI_EN_N,
+	output       PHI_EN_P,
+	output reg   RAS_N,
+	output       CAS_N,
+	output reg   CASAD_N,
+	output       READY,
+	output       CPU_N,
+	output       MWE_N,
+	output       E244_N,
+	output       ROMEN_N,
+	output       RAMRD_N,
+	output       ROM,
+	// Video-buffer latch windows: CCLK_EN_P (ring state e0) and CCLK_EN_N
+	// (state 03) are exactly the twice-per-character VIDEO_BUF phases of the
+	// reference; the motherboard samples the VRAM byte on each to assemble
+	// the 16-bit VIDEOD word for asic_video.
+
+	// ---- P3 programmable raster interrupt (reference §7) ----
+	input  [7:0] pri,        // &6800 storage (asic_regs)
+	input  [8:0] crtc_line,  // {VC5..VC0, RC2..RC0} from asic_video
+	input        crtc_adj,   // vertical-adjust active: PRI never fires
+	input        intack,     // acknowledge cycle (M1 low with IORQ low)
+	output       int_last_raster, // persistent "last ack was raster" (DCSR b7)
+
+	// ---- Sync shaping / interrupts (mirrors ga40010 sync outputs) ----
+	output       HSYNC_O,
+	output       VSYNC_O,
+	output       SYNC_N,
+	output       INT_N,
+	output       VBLANK,    // ga40010 HCNTLT28 analogue
+	output       MODE_SYNC_EN, // classic netlist-reference hdelay event
+	output reg   ASIC_MODE_SYNC_EN, // qualified Plus decoder-mode update
+	output [1:0] MODE,
+
+	// ---- Legacy GA register file, driving asic_video ----
+	output [4:0]  BORDER_O,   // border hardware colour number
+	output [79:0] INKR_O,     // 16 hardware colour numbers, entry k at
+	                          // [k*5 +: 5] (asic_video INKR_I packing)
+	output [1:0]  GAMODE_O,   // RMR VM bits, unsynchronised; decoder
+	                          // consumes them on ASIC_MODE_SYNC_EN
+
+	// ---- B8-3 accepted legacy palette write event (Arnold V §2.2 ----
+	// secondary port: each accepted INKR write maps its 5-bit colour into
+	// the palette entry at the pointer). inkr_en/border_en below already
+	// ARE the accepted strobes (sequencer window + &7Fxx decode); they are
+	// exposed here so the palette owner sees write EVENTS, not shadow
+	// values. WR is combinational with the acceptance (reset-gated);
+	// ADDR is canonical 0..15 pens / 16 border; DATA is the 5-bit HW
+	// colour. inksel cannot change on the same cycle (ink_en vs
+	// inkr/border are mutually exclusive on D[7:6]), so ADDR is coherent.
+	// A future snapshot restore of the GA shadows must NOT drive WR, so a
+	// restored 12-bit palette survives (B8-5 boundary).
+	output        LEGACY_PAL_WR,
+	output [4:0]  LEGACY_PAL_ADDR,
+	output [4:0]  LEGACY_PAL_DATA,
+
+	// ---- B8-5 snapshot apply ----
+	//
+	// SNA_LOAD is the shared plus_sna_apply pulse and every input is a
+	// SETTLED header value. Restoring the register file here deliberately
+	// does NOT raise LEGACY_PAL_WR: a snapshot must not impersonate an
+	// ordinary I/O write, so a CPC+ 12-bit palette survives the apply.
+	//
+	// The sync/interrupt state below is seeded from the serialized counters
+	// AND from the settled raw sync levels, so the first clock after the
+	// apply cannot manufacture an HSYNC or VSYNC edge that the file did not
+	// contain (which would advance hcnt, reset the interrupt counter or fire
+	// a spurious interrupt).
+	input         SNA_LOAD,
+	input   [4:0] SNA_INKSEL,   // header 2E
+	// Hardware colours occupy the low five bits of each palette byte, and only
+	// the low nibble of the RMR byte is a Gate Array control field; the rest is
+	// reserved in the format and deliberately unread here.
+	/* verilator lint_off UNUSEDSIGNAL */
+	input [135:0] SNA_PALETTE,  // header 2F-3F, pen k at [k*8 +: 5]
+	input   [7:0] SNA_CONFIG,   // header 40 (RMR: ROM enables + mode)
+	/* verilator lint_on UNUSEDSIGNAL */
+	input   [1:0] SNA_VSDELAY,  // header B2, REMAINING delayed-HSYNC count
+	input   [5:0] SNA_INTCNT,   // header B3, interrupt scanline counter 0..51
+	input         SNA_INT,      // header B4 (already attributed to this owner)
+	input         SNA_VS,       // header B0 bit 0, raw CRTC VSYNC level
+	input         SNA_HS        // header B0 bit 1, raw CRTC HSYNC level
+);
+
+	wire reset = ~RESET_N;
+
+//----------------------------------------------------------------------
+// Sequencer S: eight-phase ring advanced by cen_16. U204 restarts the
+// ring from bit 1 on an interrupt-acknowledge-flavoured bus state and is
+// simultaneously part of the normal counting term (S[6] & ~S[7]).
+//----------------------------------------------------------------------
+
+	reg [7:0] S;
+	wire U204 = (reset & ~M1_N & ~IORQ_N & ~RD_N) | (S[6] & ~S[7]);
+
+	always @(posedge clk) begin
+		if (cen_16) begin
+			S[0] <= ~S[7];
+			S[1] <= S[0] | U204;
+			S[2] <= S[1] | U204;
+			S[3] <= S[2] | U204;
+			S[4] <= S[3] | U204;
+			S[5] <= S[4] | U204;
+			S[6] <= S[5] | U204;
+			S[7] <= S[6];
+		end
+	end
+
+	// PHI/RAS decode, registered on the dot clock.
+	always @(posedge clk) begin
+		if (cen_16) begin
+			PHI_N   <= (S[1] ^ S[3]) | (S[5] ^ S[7]);
+			RAS_N   <= (S[6] | ~S[2]) & S[0];
+			CASAD_N <= RAS_N;
+		end
+	end
+
+	assign PHI_EN_N = cen_16 & (S == 8'hc0 || S == 8'h03 || S == 8'h3f || S == 8'hfc);
+	assign PHI_EN_P = cen_16 & (S == 8'h00 || S == 8'h0f || S == 8'hff || S == 8'hf0);
+	assign CCLK     = ~(S[2] | S[5]);
+	assign CCLK_EN_P = cen_16 & (S == 8'he0);
+	assign CCLK_EN_N = cen_16 & (S == 8'h03);
+	assign CPU_N    = ~(S[1] & ~S[7]);
+	assign MWE_N    = ~(RD_N & S[0] & S[5]);
+	assign E244_N   = ~(~IORQ_N & S[2] & S[3]);
+
+	// READY: set-dominant RS latch in the main clock domain (set wins when
+	// both terms are active on the same edge), holding between events.
+	wire ready_set = (S[3] & ~S[6]);
+	wire ready_rst = CASAD_N;
+	reg  ready_hold;
+	reg  ready_q;
+	always @(*) begin
+		if (ready_set)      ready_q = 1'b1;
+		else if (ready_rst) ready_q = 1'b0;
+		else                ready_q = ready_hold;
+	end
+	always @(posedge clk) ready_hold <= ready_q;
+	assign READY = ready_q;
+
+//----------------------------------------------------------------------
+// CAS generation. U708 masks refresh: between the end of the M1 cycle and
+// the release of MREQ, an active MREQ does not generate an active CAS
+// (the DRAM row is refreshed by the CRTC address bus in that window).
+// U712 stretches CAS across the CPU cycle; S_d1/S_d2 blank CAS during
+// the video transfer phases.
+//----------------------------------------------------------------------
+
+	reg U708; // 0 = MREQ masked
+	reg M1_N_d, MREQ_N_d;
+	always @(posedge clk) begin
+		M1_N_d   <= M1_N;
+		MREQ_N_d <= MREQ_N;
+	end
+
+	always @(posedge clk or negedge RESET_N) begin
+		if (!RESET_N)                 U708 <= 1'b1;
+		else if (~M1_N_d & M1_N)      U708 <= 1'b0;
+		else if (~MREQ_N_d & MREQ_N)  U708 <= 1'b1;
+	end
+
+	reg S_d1, S_d2; // u706 / u709
+	always @(posedge clk) begin
+		if (cen_16) begin
+			S_d1 <= (~S[4] & S[5]) | (~S[3] & S[1]) | (S[1] & S[7]);
+			S_d2 <= S_d1;
+		end
+	end
+
+	wire U710    = ~U708 | MREQ_N | ~S[4] | S[5];
+	wire u712_s  = S_d1;
+	wire u712_r  = ~(S[2] & U710);
+	reg  u712_hold;
+	reg  u712_q;
+	// Reset-dominant latch (reset wins on simultaneity).
+	always @(*) begin
+		if (u712_r)         u712_q = 1'b0;
+		else if (u712_s)    u712_q = 1'b1;
+		else                u712_q = u712_hold;
+	end
+	always @(posedge clk) u712_hold <= u712_q;
+
+	assign CAS_N = u712_q | S_d1 | S_d2;
+
+//----------------------------------------------------------------------
+// Legacy GA register file: port &7Fxx decode latching on the sequencer's
+// register window (or immediately in fast/no-wait mode). IRQ reset is
+// RMR bit 4. Power-up/reset values match the classic FPGA power-up state
+// (ga40010 relies on init for these; here they are explicit RTL resets):
+// INKR entries and ink select reset to 0 — the real-ASIC power-up contents
+// are undocumented (named assumption, see header).
+//----------------------------------------------------------------------
+
+	reg [4:0] inksel;
+	reg [4:0] border;
+	reg [79:0] inkr; // entry k at [k*5 +: 5]
+	reg       hromen, lromen, mode1, mode0;
+
+	wire reg_latch = (S[0] & S[7]) | (fast & ~E244_N);
+	wire reg_sel   = reg_latch & ~IORQ_N & ~A[15] & A[14] & M1_N;
+	wire ink_en    = reg_sel & ~D[7] & ~D[6];
+	wire border_en = reg_sel & ~D[7] &  D[6] &  inksel[4];
+	// Locked 101xxxxx aliases MRER; unlocked 101xxxxx is RMR2 only (sources at
+	// the plus_unlocked port declaration above).
+	wire ctrl_en   = reg_sel &  D[7] & ~D[6] & (~plus_unlocked | ~D[5]);
+	wire inkr_en   = reg_sel & ~D[7] &  D[6] & ~inksel[4];
+
+	wire irq_reset = ctrl_en & D[4];
+
+	// Explicit RTL resets for inksel/inkr: without these the power-up
+	// values would be whatever the simulator/FPGA init gives them. Zero
+	// matches the classic FPGA power-up state; the real ASIC power-up
+	// contents are undocumented (named assumption, header comment above).
+	// The !reset guards keep the reset dominant while leaving every write
+	// a top-level if — the else-wrapped form trips an internal error in
+	// older Verilator (5.020 V3Gate ICE).
+	integer sna_i;
+	always @(posedge clk) begin
+		if (reset) border <= 5'b10000;
+		else if (SNA_LOAD) border <= SNA_PALETTE[128 +: 5];
+		else if (border_en) border <= D[4:0];
+
+		if (reset) {hromen, lromen, mode1, mode0} <= 4'd0;
+		else if (SNA_LOAD) {hromen, lromen, mode1, mode0} <= SNA_CONFIG[3:0];
+		else if (ctrl_en) {hromen, lromen, mode1, mode0} <= D[3:0];
+
+		if (reset) begin
+			inksel <= 5'd0;
+			inkr   <= 80'd0;
+		end
+		if (!reset && SNA_LOAD) begin
+			inksel <= SNA_INKSEL;
+			for (sna_i = 0; sna_i < 16; sna_i = sna_i + 1)
+				inkr[sna_i*5 +: 5] <= SNA_PALETTE[sna_i*8 +: 5];
+		end
+		if (!reset && !SNA_LOAD && ink_en)  inksel <= D[4:0];
+		if (!reset && !SNA_LOAD && inkr_en) inkr[inksel[3:0]*5 +: 5] <= D[4:0];
+	end
+
+	assign BORDER_O  = border;
+	assign INKR_O    = inkr;
+	assign GAMODE_O  = {mode1, mode0};
+	assign MODE      = {mode1, mode0};
+
+	assign LEGACY_PAL_WR   = ~reset & (inkr_en | border_en);
+	assign LEGACY_PAL_ADDR = border_en ? 5'd16 : {1'b0, inksel[3:0]};
+	assign LEGACY_PAL_DATA = D[4:0];
+
+	// Lower/upper ROM mapping exactly as the classic Gate Array decodes it;
+	// in Plus mode plus_mmu overlays cartridge windows on top of this.
+	wire rom_map_rom = (~lromen & ~A[15] & ~A[14]) | (~hromen & A[15] & A[14]);
+	assign ROM     = rom_map_rom;
+	assign ROMEN_N = ~rom_map_rom | MREQ_N | RD_N;
+	assign RAMRD_N =  rom_map_rom | MREQ_N | RD_N;
+
+//----------------------------------------------------------------------
+// Monitor-side sync shaping and the 52-line interrupt counter.
+//
+// hcnt walks a fixed 26-line sequence on each falling edge of the CRTC
+// HSYNC and parks at 5'h1E if no VSYNC arrives (lost-sync state). VSYNC_O
+// (monitor C-VSYNC) is emitted while hcnt sits in 4..7; VBLANK
+// (HCNTLT28) while it is NOT in 28..31 — the ASIC's vertical-blank
+// window. hdelay reshapes HSYNC into the monitor HSYNC_O with its own
+// microsequence. intcnt uses delayed normal HSYNC falls and fires on the
+// 52nd; RMR bit 4 or a source-qualified raster acknowledge clears the
+// request. The shaped VSYNC-edge term and pending token absorb the reset
+// line through delayed count admission; their topology remains a B26 model.
+//
+// All of this free-runs on clk; only the vsync edge detectors are
+// sampled once per character (CCLK_EN_N).
+//----------------------------------------------------------------------
+
+	reg [5:0] intcnt_reg, intcnt_next;
+	reg [4:0] hcnt_reg, hcnt_next;
+	reg [3:0] hdelay_reg;
+
+	reg  vsync_d;    // u803
+	wire hsync_n = ~HSYNC_I; // u801
+	reg  hsync_n_d;
+	reg  vsync_o_d;  // u812
+	reg  irqack_rst;
+
+	//------------------------------------------------------------------
+	// B8-5 snapshot phase seeds for the hcnt VSYNC-delay chain.
+	//
+	// hcnt walks 00 -> 01 -> 06 -> ... on each CRTC HSYNC falling edge and is
+	// forced to {0000,b0} at the raw VSYNC rising edge; the shaped VSYNC_O
+	// (and with it the interrupt-counter re-sync, intcntclr_4) rises when
+	// hcnt reaches 06. Two or three HSYNCs therefore separate the raw VSYNC
+	// start from that re-sync, which is exactly the "0..2, counts down to the
+	// reset action" B2 field (docs/plus/b8-5-snapshot-apply-2026-09-08.md,
+	// where the format's own prose is resolved against Caprice32's runtime
+	// and loader):
+	//   B2 = 2 -> no HSYNC seen yet     -> hcnt 00, next 01
+	//   B2 = 1 -> one HSYNC seen        -> hcnt 01, next 06
+	//   B2 = 0 -> delay already expired -> hcnt 06 while a raw VSYNC is still
+	//             active (vsync_o_d seeded 1 so the re-sync does not fire a
+	//             second time), otherwise the parked lost-sync state 1E.
+	// hcnt_next is seeded with hcnt's successor because it is a registered
+	// lookup: a stale value would jump the chain on the next HSYNC. B2 = 3 is
+	// outside the documented range and falls into the B2 = 0 case.
+	//------------------------------------------------------------------
+	wire [4:0] sna_hcnt_seed = (SNA_VSDELAY == 2'd2) ? 5'h00 :
+	                           (SNA_VSDELAY == 2'd1) ? 5'h01 :
+	                           SNA_VS                ? 5'h06 : 5'h1E;
+	wire [4:0] sna_hcnt_next_seed = (SNA_VSDELAY == 2'd2) ? 5'h01 :
+	                                (SNA_VSDELAY == 2'd1) ? 5'h06 :
+	                                SNA_VS                ? 5'h07 : 5'h1E;
+	wire       sna_vsync_o_seed = (SNA_VSDELAY == 2'd0) & SNA_VS;
+
+	// Edge detectors. On the apply edge the raw sync histories take the
+	// SETTLED header levels: without that, an active restored HSYNC or VSYNC
+	// reads as a fresh edge on the very next clock.
+	always @(posedge clk) begin
+		if (SNA_LOAD) begin
+			hsync_n_d <= ~SNA_HS;
+			vsync_d   <= SNA_VS;
+			vsync_o_d <= sna_vsync_o_seed;
+		end
+		else begin
+			hsync_n_d <= hsync_n;
+			if (CCLK_EN_N) begin
+				vsync_d   <= VSYNC_I;
+				vsync_o_d <= VSYNC_O_int;
+			end
+		end
+	end
+
+	wire hcnt_cnt = ~hsync_n_d & hsync_n;
+
+	// Combinational hcnt with reset overrides, registered form follows.
+	wire [4:0] hcnt_comb_base = hcnt_cnt ? hcnt_next : hcnt_reg;
+	wire hcnt_res0 = ~RESET_N | (hcnt_cnt & hcnt_next[2] & hcnt_next[3] & hcnt_next[4]);
+	wire hcnt_res1 = VSYNC_I & ~vsync_d;
+
+	reg [4:0] hcnt_comb;
+	always @(*) begin
+		hcnt_comb = hcnt_comb_base;
+		if (hcnt_res0) hcnt_comb[0]   = 1'b0;
+		if (hcnt_res1) hcnt_comb[4:1] = 4'd0;
+	end
+
+	wire VSYNC_O_int = hcnt_comb[2] & ~hcnt_comb[3] & ~hcnt_comb[4];
+	wire VBLANK_comb = ~(hcnt_comb[2] & hcnt_comb[3] & hcnt_comb[4]);
+
+	always @(posedge clk) begin
+		if (SNA_LOAD) begin
+			hcnt_reg  <= sna_hcnt_seed;
+			hcnt_next <= sna_hcnt_next_seed;
+		end
+		else begin
+		hcnt_reg <= hcnt_comb;
+		case (hcnt_comb)
+		5'h00: hcnt_next <= 5'h01;
+		5'h01: hcnt_next <= 5'h06;
+		5'h06: hcnt_next <= 5'h07;
+		5'h07: hcnt_next <= 5'h04;
+		5'h04: hcnt_next <= 5'h05;
+		5'h05: hcnt_next <= 5'h0A;
+		5'h0A: hcnt_next <= 5'h0B;
+		5'h0B: hcnt_next <= 5'h08;
+		5'h08: hcnt_next <= 5'h09;
+		5'h09: hcnt_next <= 5'h0E;
+		5'h0E: hcnt_next <= 5'h0F;
+		5'h0F: hcnt_next <= 5'h0C;
+		5'h0C: hcnt_next <= 5'h0D;
+		5'h0D: hcnt_next <= 5'h12;
+		5'h12: hcnt_next <= 5'h13;
+		5'h13: hcnt_next <= 5'h10;
+		5'h10: hcnt_next <= 5'h11;
+		5'h11: hcnt_next <= 5'h16;
+		5'h16: hcnt_next <= 5'h17;
+		5'h17: hcnt_next <= 5'h14;
+		5'h14: hcnt_next <= 5'h15;
+		5'h15: hcnt_next <= 5'h1A;
+		5'h1A: hcnt_next <= 5'h1B;
+		5'h1B: hcnt_next <= 5'h18;
+		5'h18: hcnt_next <= 5'h19;
+		5'h19: hcnt_next <= 5'h1E;
+		default: ;
+		endcase
+		end
+	end
+
+	// Monitor HSYNC microsequence.
+	wire hdelay_res0 = hsync_n | hdelay_reg[3]; // u804
+	wire hdelay_res1 = hsync_n;                 // u822
+
+	reg hdelay_res0_d, hdelay2d;
+	always @(posedge clk) begin
+		if (SNA_LOAD) begin
+			// Consistent with the hdelay_reg = 0 seed below: HSYNC_O low, so
+			// no mode-resync strobe and no shaped trailing edge next clock.
+			hdelay_res0_d <= ~SNA_HS;
+			hdelay2d      <= 1'b0;
+		end
+		else begin
+			hdelay_res0_d <= hdelay_res0;
+			hdelay2d      <= hdelay_comb[2];
+		end
+	end
+
+	reg [3:0] hdelay_comb;
+	reg mode_sync_en_w;
+	always @(*) begin
+		hdelay_comb  = hdelay_reg;
+		mode_sync_en_w = ~hdelay_res0_d & hdelay_res0 & hdelay2d;
+		if (hdelay_res0) hdelay_comb[2:0] = 3'd0;
+		if (hdelay_res1) hdelay_comb[3]   = 1'b0;
+	end
+	assign MODE_SYNC_EN = mode_sync_en_w;
+
+	always @(posedge clk) begin
+		// The monitor-side shaping phase is not serialized by the format:
+		// deterministic restart of the microsequence.
+		if (SNA_LOAD) hdelay_reg <= 4'd0;
+		else if (hdelay_res0 | hdelay_res1) hdelay_reg <= hdelay_comb;
+		else if (CCLK_EN_N) begin
+			case (hdelay_comb)
+			4'h0: hdelay_reg <= 4'h1;
+			4'h1: hdelay_reg <= 4'h6;
+			4'h6: hdelay_reg <= 4'h7;
+			4'h7: hdelay_reg <= 4'h4;
+			4'h4: hdelay_reg <= 4'h5;
+			4'h5: hdelay_reg <= 4'h8;
+			default: ;
+			endcase
+		end
+	end
+
+	assign HSYNC_O = hdelay_comb[2];
+	assign SYNC_N  = ~(VSYNC_O_int ^ HSYNC_O);
+
+	// ASIC graphic-mode qualification is separate from monitor/IRQ shaping.
+	// ACCC v1.11 FR §§9.3.1–9.3.3 pp.52–53: all chips require >=2us
+	// raw HSYNC; the ASIC defers its GA interval by 1us and caps that
+	// interval at 6us. Deriving the short-pulse bound from p.52 leaves
+	// the request open one character after a valid raw fall; the long-
+	// pulse raw start+7us deadline is charted in §9.3.3 p.53.
+	// HSYNC_I is registered only on CCLK_EN_N or SNA_LOAD by asic_video;
+	// edge detection therefore sees ordinary falls between CCLK enables.
+	// Exact type3 mixed-byte pixel phase is unresolved (§9.3.4.1 p.54).
+	reg       mode_hsync_d, mode_tracking, mode_fell;
+	reg [2:0] mode_elapsed;
+	always @(posedge clk) begin
+		ASIC_MODE_SYNC_EN <= 1'b0;
+		if (reset | SNA_LOAD) begin
+			// The decoder separately restores settled SNA_MODE. No event
+			// may escape from the pre-restore or already-running pulse.
+			mode_hsync_d <= ~reset & SNA_LOAD & SNA_HS;
+			mode_tracking <= 1'b0;
+			mode_fell <= 1'b0;
+			mode_elapsed <= 3'd0;
+		end
+		else begin
+			mode_hsync_d <= HSYNC_I;
+			if (HSYNC_I & ~mode_hsync_d) begin
+				mode_tracking <= 1'b1;
+				mode_fell <= 1'b0;
+				mode_elapsed <= 3'd0;
+			end
+			else if (mode_tracking) begin
+				if (~HSYNC_I & mode_hsync_d) begin
+					if (mode_elapsed < 3'd2) mode_tracking <= 1'b0;
+					else mode_fell <= 1'b1;
+				end
+				if (CCLK_EN_N) begin
+					if (mode_fell | (mode_elapsed == 3'd6)) begin
+						ASIC_MODE_SYNC_EN <= 1'b1;
+						mode_tracking <= 1'b0;
+						mode_fell <= 1'b0;
+					end
+					else mode_elapsed <= mode_elapsed + 3'd1;
+				end
+			end
+		end
+	end
+
+	// MODEL LIMIT (B26): private delayed-normal-count hypothesis only.
+	// Reuse the PRI one-character HSYNC history for compatible normal line
+	// counting; no new numeric delay or change to raw monitor/VS ownership.
+	// Falling-edge history refills from raw while PRI history is invalid,
+	// preventing an import/reset refill from manufacturing a count event.
+	// See docs/investigations/hardware-runs/
+	// shaker-crtc3-br-delayed-count-2026-11-06.md and B26.
+	reg intcnt_hs_q;
+	always @(posedge clk) begin
+		if (!pri_valid) intcnt_hs_q <= HSYNC_I;
+		else            intcnt_hs_q <= pri_hs_d;
+	end
+	wire intcnt_cnt = pri_valid & intcnt_hs_q & ~pri_hs_d;
+
+	// Interrupt counter: cleared at 52 delayed normal HSYNC falls, on the shaped VSYNC
+	// edge, by RMR bit 4, or (bit5 only) by a raster acknowledge.
+	wire intcnt52 = intcnt_cnt & intcnt_next[2] & intcnt_next[4] & intcnt_next[5];
+	wire intcntclr_52_s = intcnt52;
+	wire intcntclr_52_r = pri_hs_d;
+	reg  intcntclr_52_hold;
+	reg  intcntclr_52;
+	// Reset-dominant latch: while delayed HSYNC is asserted the clear
+	// flag is forced low by that same delayed HSYNC; its trailing count sets it.
+	always @(*) begin
+		if (intcntclr_52_r)      intcntclr_52 = 1'b0;
+		else if (intcntclr_52_s) intcntclr_52 = 1'b1;
+		else                     intcntclr_52 = intcntclr_52_hold;
+	end
+	always @(posedge clk) intcntclr_52_hold <= SNA_LOAD ? 1'b0 : intcntclr_52;
+
+	wire intcntclr_4 = VSYNC_O_int & ~vsync_o_d; // u817
+	// MODEL LIMIT (B26): this private delayed-normal-count model keeps the
+	// VS reset line absorbed through its delayed count admission. ACCC FR
+	// §§27.1-27.2 p.283 and §27.3.2 p.284 require unconditional rephase at
+	// the second HSYNC end; they do not establish this internal topology.
+	// Raw/delayed event unification remains unresolved; see
+	// docs/investigations/hardware-runs/
+	// shaker-crtc3-br-delayed-count-2026-11-06.md and B26. Reset/import
+	// abandon a pre-existing token; restored B2 owns subsequent VS rephase.
+	// Re-arm only with valid current-epoch character history. During the
+	// U204 reset restart, CCLK sampling can stop and leave an old clear
+	// high until the first refill strobe; it must not re-arm a stale token.
+	reg vs_rephase_pending;
+	always @(posedge clk) begin
+		if (reset || SNA_LOAD) vs_rephase_pending <= 1'b0;
+		else if (intcntclr_4 && pri_valid) vs_rephase_pending <= 1'b1;
+		else if (intcnt_cnt) vs_rephase_pending <= 1'b0;
+	end
+	// A PRI raster fire clears counter bit 5 as an acknowledge would, so a
+	// re-enabled CPC-compatible interrupt cannot occur within 32 lines
+	// (reference §7, [KT]). The counter itself keeps counting.
+	wire intcnt_res0 = intcntclr_52 | intcntclr_4 | vs_rephase_pending | irq_reset; // u831
+	wire intcnt_res1 = intcnt_res0 | irqack_rst | raster_fire; // u833 + P3
+
+	reg [5:0] intcnt_comb;
+	always @(*) begin
+		intcnt_comb = intcnt_reg;
+		if (intcnt_res0) intcnt_comb[4:0] = 5'd0;
+		else if (intcnt_cnt) intcnt_comb = intcnt_next;
+		if (intcnt_res1) intcnt_comb[5] = 1'b0;
+	end
+
+	always @(posedge clk) begin
+		if (SNA_LOAD) begin
+			// Header B3, the GA interrupt scanline counter (0..51). intcnt_next
+			// is a registered successor, so it is seeded too: the 52nd-line
+			// comparator reads it directly and a stale value would either lose
+			// or duplicate the next interrupt.
+			intcnt_reg  <= SNA_INTCNT;
+			intcnt_next <= SNA_INTCNT + 6'd1;
+		end
+		else begin
+			intcnt_reg  <= intcnt_comb;
+			intcnt_next <= intcnt_comb + 6'd1;
+		end
+	end
+
+	// Only an ACK selected as raster may arm the held counter clear. A DMA
+	// ACK can overlap raw compatible creation and its later CPU delivery;
+	// neither transition may reclassify that ACK or reset the counter.
+	// Original-Plus evidence: docs/plus/pa7-dma-overlap-original-plus-2026-09-28.md.
+	// Source selection matches asic_regs: delivered raster at each ASIC ACK
+	// start, held for that pulse. DCSR first-pulse provenance is separate.
+	wire classic_raw_n;
+	wire irqack_s = ~(classic_raw_n | IORQ_N | M1_N) & ack_raster_selected;
+	wire irqack_r = M1_N;
+	reg  irqack_hold;
+	always @(*) begin
+		if (irqack_s)      irqack_rst = 1'b1;
+		else if (irqack_r) irqack_rst = 1'b0;
+		else               irqack_rst = irqack_hold;
+	end
+	always @(posedge clk) irqack_hold <= SNA_LOAD ? 1'b0 : irqack_rst;
+
+	//------------------------------------------------------------------
+	// P3 programmable raster interrupt (reference §7, [ARNOLD-REV §2.4]).
+	//
+	// PRI == 0: the 52-line sequence keeps source-qualified ACK clearing;
+	// this private candidate delays normal count admission using PRI HSYNC.
+	//
+	// PRI != 0: the counter KEEPS RUNNING but its interrupt assertion is
+	// suppressed; the programmed request is the RISING EDGE of
+	//
+	//     C = HSYNC_d && PRI != 0 &&
+	//         (({1'b0, PRI} == line_d && !adj_d) || ({1'b0, PRI} == line && !adj))
+	//
+	// where HSYNC_d, line_d ({VC5..VC0, RC2..RC0}) and adj_d are the CRTC
+	// outputs delayed by exactly one character (1 us), line and adj are
+	// live, and PRI is live. The line compare therefore spans the character
+	// in which the line changes: HSYNC_d rising is judged against the old
+	// line, and a line change while HSYNC_d is high is seen at once.
+	// The leading 0 is a compared bit, not a don't-care: lines 256 and above
+	// never match, so PRI=&37 fires on line 55 only and not on line 311 of
+	// a 312-line frame (Copter 271's title palette chain; original-Plus
+	// alias probe, 32 IRQs in all four cases). Cleared by CPU acknowledge
+	// or MRER bit 4, shared with the classic path.
+	//
+	// This single comparator is the mechanism recorded in
+	// docs/plus/source-divergences.md ("PRI delayed-comparator candidate");
+	// AmSpirit matches every original-Plus probe screen, and it reproduces:
+	//  - the ordinary request 1 us after raw HSYNC assertion at every width,
+	//    including width 1 (probe 01; flat-plane markers ~136/135/139 dots at
+	//    R3=3/6/11, docs/plus/references/eerie-pri-trigger-counterfactual-
+	//    2026-09-27.md). Written accounts differ: [ARNOLD-REV] names the
+	//    monitor HSYNC trailing edge, [KT] ~10 us;
+	//  - a PRI write to the current line requesting while HSYNC_d is high,
+	//    one character past raw HSYNC end (probe 04: writes C0 45..60 with
+	//    HSYNC 49..59). FF2's palette chain relies on this (46->48 at C0=52
+	//    of line 48, docs/plus/references/ff2-runtime-pri-2026-09-27.md);
+	//  - HSYNC crossing into the PRI line requests at its C0 0, including
+	//    a raw HSYNC ending exactly at the line start (HSYNC_d is still high
+	//    there); with R2=R0 line_d still holds the PRI line when HSYNC_d
+	//    rises at the next line's C0 0 (probes 05-09: 1/2/2/2/2 requests;
+	//    exact-end probes 19-20: AmSpirit 2/2, and the CRTC3 demo's plasma,
+	//    sphere and Wolverine scenes at R2=50, R3=14 need that request);
+	//  - no request from same-value writes or from a held level after ACK:
+	//    there is no edge.
+	// A line matches only outside vertical adjustment; a request due from
+	// the last normal line (line_d) can still land in the first adjustment
+	// character.
+	//
+	// asic_video's CRTC advances on CLKEN = CCLK_EN_N, and HSYNC/LINE/ROW/
+	// ADJ change on that edge. Sampling them on the same strobe therefore
+	// captures the value of the character just finished: an exact 64-clock
+	// delay. Reset and snapshot import hold the edge history high until one
+	// strobe has refilled the delayed terms from the restored counters, so
+	// neither can manufacture a request (a request whose HSYNC_d rise was
+	// already due inside a restored HSYNC is dropped; header B4 carries any
+	// request the source machine had already raised).
+	//
+	// An ASIC raster fire also clears bit 5 of the 6-bit counter (as a
+	// normal acknowledge does), so a later re-enabled CPC-compatible
+	// interrupt cannot occur within 32 lines ([KT]).
+	//------------------------------------------------------------------
+
+	reg       pri_hs_d;
+	reg [8:0] pri_line_d;
+	reg       pri_adj_d;
+	reg       pri_valid;
+	reg       pri_c_q;
+	always @(posedge clk) begin
+		if (CCLK_EN_N) begin
+			pri_hs_d   <= HSYNC_I;
+			pri_line_d <= crtc_line;
+			pri_adj_d  <= crtc_adj;
+		end
+		if (reset || SNA_LOAD) pri_valid <= 1'b0;
+		else if (CCLK_EN_N)    pri_valid <= 1'b1;
+	end
+	wire pri_c = pri_hs_d && (pri != 8'd0) &&
+	             ((({1'b0, pri} == pri_line_d) && !pri_adj_d) ||
+	              (({1'b0, pri} == crtc_line) && !crtc_adj));
+	always @(posedge clk) pri_c_q <= pri_valid ? pri_c : 1'b1;
+	wire raster_fire = !reset && !SNA_LOAD && pri_valid && pri_c && !pri_c_q;
+
+	// Persistent last-ack-was-raster level for DCSR bit 7 (reference
+	// section 9: set if the LAST INT acknowledge was raster). The level
+	// latches at the START of each CPU acknowledge cycle from the raster
+	// request pending at that instant (!INT_N: this module asserts INT_N
+	// only for raster, classic or PRI) and holds until the next
+	// acknowledge. In particular a raster fire AFTER a DMA acknowledge
+	// must not set it: the handler's DCSR read then takes the DMA path
+	// (Copter 271 title flash). Sampling at acknowledge start matters:
+	// sampling later would see INT_N risen by the irqack path and
+	// misread a raster acknowledge as empty.
+	// CPU interrupt acknowledge or explicit reset active:
+	// - int_reset: irq_reset (MRER bit 4 write) or irqack_rst (classic raster ack).
+	// - intack: active CPU interrupt acknowledge cycle (/IORQ + /M1).
+	// When a DMA interrupt acknowledge is in flight, intack is high while INT_N
+	// (driven here) is initially 1'b1. If a raster_fire pulse coincides with
+	// that window, holding INT_N high throughout prevents irqack_s from
+	// falsely asserting and dropping the event. The fire is latched in
+	// raster_fire_pending and pulled low on the cycle following deassertion.
+	// (Modelling choice: MRER D4 clear during coincident fire similarly holds
+	// programmed pending). Compatible creation during DMA ACK is retained,
+	// as required by the original-Plus overlap observations.
+	wire int_reset = irq_reset | irqack_rst;
+	wire int_ack_active = int_reset | intack;
+	wire classic_ack_active = int_reset | (intack & ack_raster_selected);
+
+	// Compatible overflow retains the original counter-bit falling-edge
+	// detector; only its normal count admission moves in this candidate.
+	reg  cnt5; // counter top bit, delayed one clk (block below drives it)
+	wire classic_fire = (pri == 8'd0) && ~intcnt_comb[5] & cnt5;
+
+	// PRI replaces delivery of CPC-compatible requests (Arnold V section 2.4;
+	// Extra CPC Plus Hardware Information, "When the ASIC raster interrupt
+	// is active, there are no interrupts caused by the standard CPC raster int").
+	// Keep the old CPC request while masked: a PRI=0 round trip without ACK
+	// exposes it again in the AmSpirit pending-request discriminator. A shared
+	// latch leaked that old request into Eerie Forest's first EI/JP(IX) exit.
+	// A programmed request still holds until the existing ACK/MRER clear;
+	// changing PRI must not clear it merely because its compare value changed.
+	// Raster ACK clears both latches. DMA ACK preserves the compatible latch,
+	// including when it is still undelivered or masked by PRI.
+	reg  classic_int_n;
+	reg  programmed_int_n;
+	// Keep compatible pending storage and the existing next-CCLK delivery
+	// stage for non-normal causes (including VS rephase). The private
+	// normal52 prompt below transfers only the independently prepared
+	// ordinary character delay to count admission. This candidate no longer
+	// claims classic_raw_n matches ga40010's raw counter-edge phase.
+	reg  classic_delivery_n;
+	// MODEL LIMIT (B26): transfer the ordinary normal52 character delay to
+	// count admission, with prompt delivery only for that source. Keep the
+	// existing VS-rephase delivery and MRER/ACK priority; a shared physical
+	// phase law is unresolved. This bounded split is not independently
+	// established silicon topology; see docs/investigations/hardware-runs/
+	// shaker-crtc3-br-delayed-count-2026-11-06.md and B26. The existing
+	// normal-wrap guard is retained; DMA-selected ACK retains this fire.
+	wire normal_wrap_prompt = classic_fire & intcnt_cnt & intcnt52 & ~intcntclr_4;
+	assign classic_raw_n = programmed_int_n & (classic_int_n | (pri != 8'd0));
+	assign INT_N = programmed_int_n & (classic_int_n | classic_delivery_n | (pri != 8'd0));
+
+	reg  raster_fire_pending;
+
+	reg  intack_d;
+	reg  ack_raster;
+	// Before the first sampling edge use the same live delivered source as
+	// asic_regs. Afterwards hold it even if compatible delivery matures.
+	// Do not use last_raster: it describes the first pulse in an M1 window,
+	// whereas vector arbitration and clearing occur on every ASIC pulse.
+	wire ack_raster_selected = intack_d ? ack_raster : !INT_N;
+	reg  raster_ack_seen;
+	reg  last_raster;
+	always @(posedge clk) begin
+		intack_d <= intack;
+		if (reset || SNA_LOAD) ack_raster <= 1'b0;
+		else if (intack && !intack_d) ack_raster <= !INT_N;
+
+		// Board shaping can produce two ASIC pulses within one CPU M1.
+		// Preserve the first pulse's provenance for the software handler;
+		// vector selection and DMA auto-clear still see both pulses.
+		if (reset || SNA_LOAD || M1_N) raster_ack_seen <= 1'b0;
+		else if (intack && !intack_d)  raster_ack_seen <= 1'b1;
+
+		// DCSR bit 7's restored provenance lives in asic_regs (CPC+ chunk byte
+		// 8DF bit 7, dcsr_stat) during idle before ACK; the first acknowledge
+		// retires it there while this level takes over from the live pending
+		// state, so no SNA-scoped term is needed here: a restored pending
+		// raster holds INT_N low exactly like a live one.
+		if (reset)                                    last_raster <= 1'b0;
+		else if (SNA_LOAD)                            last_raster <= 1'b0;
+		else if (intack && !intack_d && !raster_ack_seen) last_raster <= !INT_N;
+	end
+	assign int_last_raster = last_raster;
+
+	always @(posedge clk) begin
+		if (SNA_LOAD) begin
+		// cnt5 is the delayed top counter bit and the classic overflow is
+		// its FALLING edge: seeding it from the restored counter is what
+		// stops the apply from manufacturing an interrupt on the next clock.
+			cnt5  <= SNA_INTCNT[5];
+			// Header B4. It is an aggregate "an interrupt is pending" flag and
+			// cannot say whether the GA or the ASIC DMA raised it; the caller
+			// resolves that (see Amstrad_motherboard) and passes the part this
+			// owner must hold.
+			// The snapshot exposes only the delivered raster request, not a
+			// masked CPC latch. PRI has settled during the CPC+ drain before
+			// this apply pulse; attribute the request to that restored mechanism.
+			classic_int_n    <= ~(SNA_INT && (pri == 8'd0));
+			programmed_int_n <= ~(SNA_INT && (pri != 8'd0));
+			// Restored pending is immediately delivered: seed delivery exactly
+			// as the raw classic request, so SNA INT holds INT_N low like live.
+			classic_delivery_n <= ~(SNA_INT && (pri == 8'd0));
+			raster_fire_pending <= 1'b0;
+		end
+		else begin
+			cnt5 <= intcnt_comb[5];
+			if (reset) begin
+				raster_fire_pending <= 1'b0;
+			end
+			else if (int_ack_active) begin
+				if (raster_fire) raster_fire_pending <= 1'b1;
+			end
+			else begin
+				raster_fire_pending <= 1'b0;
+			end
+
+			if (int_ack_active) begin
+				if (classic_ack_active) classic_int_n <= 1'b1;
+				else if (classic_fire)  classic_int_n <= 1'b0;
+				programmed_int_n <= 1'b1;
+			end
+			else if (raster_fire_pending | raster_fire) begin
+				programmed_int_n <= 1'b0;
+			end
+			else if (classic_fire) begin
+				classic_int_n <= 1'b0;
+			end
+			// Delivery retains the existing reset behavior and raster ACK/MRER
+			// clear priority. Only a normal52 wrap is prompt; all other causes
+			// retain the existing next-CCLK sampling below.
+			if (classic_ack_active) begin
+				classic_delivery_n <= 1'b1;
+			end
+			else if (normal_wrap_prompt) begin
+				classic_delivery_n <= 1'b0;
+			end
+			else if (CCLK_EN_N) begin
+				classic_delivery_n <= classic_int_n;
+			end
+		end
+	end
+
+	assign VSYNC_O = VSYNC_O_int;
+	assign VBLANK  = VBLANK_comb;
+
+endmodule
