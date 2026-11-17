@@ -89,7 +89,7 @@ task mounter;
 					// OUT_LATENCY clocks later (its value just before that edge)
 					for (i = 0; i < 512; i = i + 1) begin
 						@(posedge clk);
-						sdc_byte_addr <= i;
+						#1 sdc_byte_addr = i;    // after the edge, as a register of kg_l2_img
 						repeat (olat - 1) @(posedge clk);
 						@(negedge clk);
 						disk[lba * 512 + i] = sdc_byte_out_data;

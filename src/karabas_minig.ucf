@@ -270,7 +270,7 @@ TIMESPEC "TS_CRTC_MC" = FROM "TG_CRTC_CNT" TO "TG_CLK_SYS" 31.25 ns;
 # so left out. The disk reads that hung on the board then (26111707..26111713) were not timing: XST made
 # tristates of the [i_current_drive] array writes of u765, fixed in its source in 26111714.)
 # Instead FROM the registers of u765 that change only on its clock enable (8 MHz; hds / ds0 and the
-# fdc.i_* of the fdc block, assigned in its "if (ce)" parts; the exceptions i_secinfo_valid /
+# fdc.i_* of the fdc block, assigned in its "if (ce)" parts; the exceptions i_secinfo_valid, i_seek_start /
 # i_current_sector_pos are also cleared on a mount, once, and held for long after): two periods
 # (26111711 without it: hds -> fdc.i_sector_size / state by 0.6 ns at 98 % slices).
 INST "core/emu/u765/hds*" TNM = "TG_U765_CE";
