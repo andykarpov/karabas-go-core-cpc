@@ -357,6 +357,11 @@ initial begin
 	image_scan_state[0] = 2'd0;
 	image_scan_state[1] = 2'd0;
 end
+// karabas: the same for sector_search_state (states 0..4, no reset): without an initial value XST
+// started it in a dead state 5..7, the sector search never ran and XST trimmed the whole read path
+// (sector_offset, i_seek_pos, sd_lba ...): disk reads hung (build 26111706). Found by giving the block
+// locals initial values one by one in a copy of rtl/sv2v/u765.v (XST of u765 alone: 1343 -> 3348 LUT).
+reg [2:0] sector_search_state = 3'd0;
 
 always @(posedge clk_sys) begin : fdc
 
@@ -391,7 +396,7 @@ always @(posedge clk_sys) begin : fdc
 	// sector search
 	reg       sector_search_ds0;
 	reg       sector_search_hds;
-	reg [2:0] sector_search_state;
+	// karabas: sector_search_state moved to module scope with an initial value (below)
 	reg [7:0] sector_pos[2][2];    // current sector on the track
 	reg[31:0] sector_offset[2][2]; // sector start offset in the image file
 	reg [7:0] sector_c[2][2];      // C
