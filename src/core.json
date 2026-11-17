@@ -1,7 +1,7 @@
 {
     "id": "cpc",
     "name": "Amstrad CPC",
-    "build": "26111704",
+    "build": "26111705",
     "visible": true,
     "type": "osd",
     "order": 26,
@@ -16,11 +16,54 @@
     "boards": {
         "minig": {
             "link": 2,
-            "build": "26111704",
+            "build": "26111705",
             "bitstream": "karabas_minig.bin"
         }
     },
     "osd": [
+        {
+            "type": "F",
+            "name": "Disk A",
+            "slot": 0,
+            "extensions": ".dsk",
+            "dir": "/cpc",
+            "hotkey": "Menu+F1"
+        },
+        {
+            "type": "F",
+            "name": "Disk B",
+            "slot": 1,
+            "extensions": ".dsk",
+            "dir": "/cpc",
+            "hotkey": "Menu+F2"
+        },
+        {
+            "type": "FL",
+            "name": "Tape",
+            "slot": 2,
+            "extensions": ".cdt",
+            "dir": "/cpc",
+            "hotkey": "Menu+F3"
+        },
+        {
+            "type": "FL",
+            "name": "Snapshot",
+            "slot": 3,
+            "extensions": ".sna",
+            "dir": "/cpc",
+            "hotkey": "Menu+F4"
+        },
+        {
+            "type": "FL",
+            "name": "ROM",
+            "slot": 4,
+            "extensions": ".e*",
+            "dir": "/cpc",
+            "hotkey": "Menu+F5"
+        },
+        {
+            "type": "-"
+        },
         {
             "type": "S",
             "name": "Model",

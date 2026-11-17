@@ -257,6 +257,11 @@ INST "mcu/u_hid/*" TNM = "TG_KEYS";
 INST "core/emu/motherboard/HID/*" TNM = "TG_KEYS";
 TIMESPEC "TS_T80_MC" = FROM "TG_T80" TO "TG_CLK_SYS" 31.25 ns;
 TIMESPEC "TS_KEYS_MC" = FROM "TG_KEYS" TO "TG_CLK_SYS" 31.25 ns;
+# u765 (as the Amstrad.sdc of MiSTer: "-to u765|i_* -setup 2"): its registers named i_* change only on
+# its clock enable (8 MHz) ("prefix internal CE protected registers with i_, so it's easier to write
+# constraints"), so the paths into them get two clk_sys periods.
+INST "core/emu/u765/*i_*" TNM = "TG_U765_I";
+TIMESPEC "TS_U765_MC" = FROM "TG_CLK_SYS" TO "TG_U765_I" 31.25 ns;
 # zhdmi takes its words from clk_pix registers into the x5 clock (the serialiser of hdmi_tx)
 TIMESPEC "TS_PIX_TO_HDMI" = FROM "TG_CLK_PIX" TO "TG_CLK_HDMI" TIG;
 # the reset (kg_sync in clk_sys and clk_pix): the locked flag of the PLL is asynchronous to them
