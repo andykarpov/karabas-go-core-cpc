@@ -1,0 +1,862 @@
+//============================================================================
+//  ACCURACY REFERENCE
+//
+//  Technical information sourced from the "Amstrad CPC CRTC Compendium" by
+//  Longshot (CC BY-NC-ND).
+//
+//  The counter, sync, and video-pointer behaviour of this module follows The
+//  Amstrad CPC CRTC Compendium v1.10, Serge Querne (Longshot / Logon System),
+//  https://shaker.logonsystem.eu -- licensed CC BY-NC-ND 4.0. Its attribution
+//  directive requires this notice in the source of CRTC emulation modules and
+//  in the credits of any distributed product built from them. Individual rules
+//  cite their ACCC section at the point of implementation.
+//============================================================================
+//
+//  Type-0 CRTC engine (HD6845S / UM6845 as fitted to the CPC classic models).
+//
+//  This module holds every type-0-specific rule of this core (type 0 is the
+//  HD6845S/UM6845, not the UM6845R the old wrapper filename referred to):
+//  R0=0 freeze, the last-line / vertical-adjustment arbitration cluster
+//  (with its private latches), the C0=0 seam comparators, the partial-VSYNC
+//  holdoff latch, and the type-0 shares of the sync and display-enable
+//  outputs. It owns only state that is provably type-0-private (cleared or
+//  held harmless while another type is selected); all shared counters stay
+//  in the CRTC wrapper so a live CRTC_TYPE change continues counting
+//  from the same state, exactly as one physical chip would.
+//
+//  CRTC_TYPE is an input here in its "another type is selected" sense: the
+//  bus-write detects and lifecycle clears are gated on it exactly as they
+//  were when this logic lived in the shared state machine.
+
+module crtc_type0_engine
+(
+	input            CLOCK,
+	input            CLKEN,
+	input            nCLKEN,
+	input            nRESET,
+	input            CRTC_TYPE,
+	input            SNA_LOAD,
+
+	input            ENABLE,
+	input            nCS,
+	input            R_nW,
+	input            RS,
+	input      [7:0] DI,
+	input      [4:0] addr,
+
+	input      [7:0] R0_h_total,
+	input      [7:0] R1_h_displayed,
+	input      [3:0] R3_h_sync_width,
+	input      [3:0] R3_v_sync_width,
+	input      [6:0] R4_v_total,
+	input      [4:0] R5_v_total_adj,
+	input      [6:0] R6_v_displayed,
+	input      [6:0] R7_v_sync_pos,
+	input      [1:0] R8_skew,
+	input      [1:0] R8_interlace,
+	input      [4:0] R9_v_max_line,
+
+	input      [7:0] hcc,
+	input      [7:0] hcc_next,
+	input            hcc_last,
+	input      [4:0] line,
+	input      [6:0] row,
+	input            in_adj,
+	input            vsync_mid_phase, // wrapper-selected count phase, including active pulse
+
+	// Wrapper-owned shared counter state read by type-0 rules.
+	input            line_last_r,
+	input            row_last_r,
+	input            frame_adj_r,
+	input            row_r6_landing, // wrapper-owned actual C4 commit reaches stored R6
+
+	// Wrapper-owned VSYNC state read by type-0 rules.
+	input            VSYNC_r,
+	input            vsync_allow,
+	input      [3:0] hsc,
+
+	// Wrapper-owned interlace parity state (ACCC v1.10 ch.19; shared flops
+	// so a live CRTC_TYPE switch continues from the same state).
+	input            parity_frame,
+	input            parity_c9,
+	input            parity_r6,
+
+	// Counter next-state contributions.
+	output           r0_frozen,
+	output           hcc_terminal,
+	output           line_new,
+	output     [4:0] line_next,
+	output     [4:0] c5_next,
+	output           row_frame_last,
+	output     [6:0] row_next,
+	output           row_new,
+	output           frame_adj,
+
+	// C0<2 comparison values and admission for the wrapper's C0=1 validation.
+	output           c0_line_last,
+	output           c0_row_last,
+	output           c1_last_line_validate,
+
+	// Arbitration route into vertical adjustment on the current CLKEN.
+	output           in_adj_route,
+	// Deferred single C4 increment while frozen at R0=0 (ACCC v1.10 13.2.6).
+	output           frozen_row_advance,
+	// |effective R5| term for the wrapper's hcc==2 adjustment-schedule update.
+	output           hcc2_adj_keep,
+	// Section 13.7.2.2 R0=1 widening: hold C0=1 on the accepting edge,
+	// then consume the programmed C4/adjustment transition at the next CLKEN.
+	output           r0_widen_hold,
+	output           r0_widen_step,
+
+	// Video pointer reload / save decisions.
+	output           reload,
+	output           row_addr_save,
+
+	// Output-stage terms.
+	output           field_count_tick,
+	output           hsync_off,
+	output     [1:0] de_index,
+	// Type-0-only substituted border-start trigger for R1>R0 (ACCC v1.10
+	// section 17.6.2); the wrapper injects it ahead of the SKEW-DISPTMG
+	// delay line. See the assign below for the rule.
+	output           spurious_border_off,
+	output           vsync_line_fire,
+	// English ACCC v1.11 section 16.4.1.2 p.169 (FR §16.4.1.2 p.170): the natural type-0
+	// comparison is considered only if C0 reached 2 on the preceding line.
+	// At an ordinary seam the just-finished line supplies the result.  The
+	// field half-line path can also reconstruct it from the line in progress
+	// after a snapshot load or live type switch cleared the private history.
+	output           vsync_c0_2_qualified,
+	output           vsync_line_blocked,
+	// F15 VSYNC delay correction (section 19.5.2): suppress holds the
+	// natural field=1 fire off during the first line of C4=R7 on a
+	// ParityFrame-odd frame; half fires the delayed pulse one line later.
+	output           vsync_delay_suppress,
+	output           vsync_delay_half,
+	output     [3:0] vsc_load,
+	output           r7_write_fire,
+	output           vsync_holdoff,
+	output           vde_toggle,
+	output           r6_vder_write,
+	output           r6_vder_value,
+
+	// F10 interlace parity updates and C9.VMA view (ACCC v1.11 section
+	// 19.8.1 pp.220-221).  pf/pc9/parity_r6 write strobes drive the
+	// wrapper's shared flops; ivm_disp/line_vma feed the wrapper's RA mux.
+	output           pf_write,
+	output           pf_value,
+	output           pc9_write,
+	output           pc9_value,
+	output           pr6_write,
+	output           pr6_value,
+	output           ivm_disp,
+	output     [4:0] line_vma
+);
+
+/* verilator lint_off WIDTH */
+
+wire register_write = ENABLE & ~nCS & ~R_nW & RS;
+
+// FR §13.6.1 p124: a too-late update does not cancel an equality already
+// sampled. The phase is an implementation inference, not a silicon edge.
+// Coverage limit, not a rule: old R0=1 (§13.7.2) and sampled-false/live-true
+// late writes keep the live path pending hardware or an author ruling.
+reg type0_r0_eq_kept;
+wire [7:0] type0_r0_at_sample = (register_write && addr == 5'd0) ? DI : R0_h_total;
+always @(posedge CLOCK) begin
+    if (!nRESET || SNA_LOAD || CRTC_TYPE || CLKEN) type0_r0_eq_kept <= 0;
+    else if (nCLKEN) type0_r0_eq_kept <= (hcc == type0_r0_at_sample) &&
+                                         (type0_r0_at_sample != 8'd1);
+end
+assign hcc_terminal = hcc_last ||
+                      (nRESET && !SNA_LOAD && !CRTC_TYPE && type0_r0_eq_kept);
+
+
+// ------------------------------------------------------------------
+// F10: type-0 IVM counting (ACCC v1.11 section 19.8.1 pp.220-221; the
+// worked tables pp.222-225, render-verified 2026-08-24, all R9=6).
+//
+// C9 keeps counting by 1; the address-visible line value is the split
+// C9.VMA = ((C9 x 2) + ParityC9) mod 32 ("the more significant bit is
+// lost", p.220).  The line-limit test has two independent IVM bits:
+//
+//   value doubled  -- lines that started with IVM on (ivm_disp, latched
+//     at each C0=0 seam from the live R8 register: the doubled value and
+//     doubled test start "on the next C0=0, after the C9/R9 test of the
+//     line", p.220 -- so the switch line itself tests raw C9).
+//   target parity  -- "R9 or ParityFrame" on the switch line (p.220
+//     pseudocode), "R9 or ParityC9" on steady IVM lines (p.221), plain R9
+//     from the exit line on (parity dropped, p.221).
+//
+// The exit line keeps the doubled value against plain R9 (p.221 prose;
+// pp.224-225 tables), which is exactly value-doubled=1 with target
+// parity=0 -- the same form the tables show.
+//
+// ParityC9 is seeded from ParityFrame when IVM turns on at a seam (the
+// tables' doubled display carries the frame parity from the first doubled
+// line on).  With even R9 it never changes afterwards: the p.220 row-end
+// ParityC9 update is gated on R9 odd -- the printed token `If R9.0=0` was
+// adjudicated 2026-08-25 as a typo for `R9.0=1` (author question Q19 main
+// token, resolved by default reading; see accc-author-questions.md item 19
+// and finding F15).  With odd R9 the update is live (F15, implemented
+// 2026-08-26): ParityC9 := C4.0(new) xor ParityFrame at every IVM row end
+// and the frame parity at each origin, and the limit target becomes
+// R9 + (ParityC9 xor R9.0) -- the p.207 worked example's 5/4 line
+// alternation.  The section 19.5.2 VSYNC delay-by-1-line correction for
+// odd-C4 R7 on ParityFrame-odd frames is implemented with it (see the
+// vsync delay block below). French v1.11 section19.8.1 p221 and rendered
+// exit tables pp224-225 retain the IVM-derived comparison for the exit
+// line, then resume ordinary raw-C9 counting from the following line.
+reg        ivm_disp_r;    // this line started with IVM active
+reg        tog_line;      // an R8 toggle write landed during this line
+reg        tog_enter_line;
+
+wire r8_write_hit_t0 = !CRTC_TYPE & ENABLE & RS & ~nCS & ~R_nW & (addr == 5'd08);
+wire r8_toggle_write_t0 = r8_write_hit_t0 && ((DI[1:0] == 2'b11) != ivm_disp_r);
+
+// The seam edge (hcc==0) latches the new line's mode from the live R8
+// register and consumes the previous line's toggle status.  Both updates
+// are nonblocking, so the seam capture below reads the pre-edge values:
+// a toggle write from the previous line still qualifies this line's
+// target, and a write landing exactly on the seam edge qualifies only
+// from the next line ("after the C9/R9 test of the line").
+// Named residual (review N-7, 2026-08-25): under the R0=0 freeze C0 is
+// pinned at 0, so this seam predicate fires every CLKEN and a toggle
+// write's line-scoped status is consumed immediately.  A switch line inside
+// an R0=0 freeze therefore loses its one-line target adjustment; the
+// combination (IVM toggle during a frozen C0) is unpinned in the source.
+wire type0_seam = CLKEN && (hcc == 0);
+
+always @(posedge CLOCK) begin
+	if(~nRESET | SNA_LOAD | CRTC_TYPE) begin
+		ivm_disp_r <= 0;
+		tog_line <= 0;
+		tog_enter_line <= 0;
+	end
+	else begin
+		if(type0_seam) begin
+			ivm_disp_r <= (R8_interlace == 2'b11);
+			tog_line <= 0;
+		end
+		if(r8_toggle_write_t0) begin
+			tog_line <= 1;
+			tog_enter_line <= (DI[1:0] == 2'b11);
+		end
+		// Named residual (review N-6, 2026-08-25): OUT R8,3 followed by
+		// OUT R8,0 inside one line leaves tog_enter_line set, so that
+		// line's limit target keeps the entering R9-or-ParityFrame form
+		// even though R8 ended at 0.  The source pins neither this nor the
+		// type-1 back-to-back case; the last write winning would be an
+		// equally defensible model.  Unpinned -- do not fixture.
+	end
+end
+
+// ParityC9 seeding: IVM turning on at this seam plants the frame parity
+// (the tables' doubled display parity from the first doubled line on).
+wire type0_ivm_turn_on = type0_seam && !ivm_disp_r && (R8_interlace == 2'b11);
+
+// F15: with R9 odd the p.220 row-end update re-derives the parity at every
+// IVM row end, ParityC9 := C4.0(new) xor ParityFrame (the pseudocode's
+// post-increment C4.0), and at a true frame origin the new frame's parity
+// (ParityR6 snapshot) -- the p.207 table's frame-start rows.  Even R9
+// leaves ParityC9 at its seeded value, exactly as before.
+wire type0_pc9_odd_update = R9_v_max_line[0] && ivm_disp_r &&
+                            (pf_write || (row_new && !in_adj));
+assign pc9_write = type0_ivm_turn_on || type0_pc9_odd_update;
+assign pc9_value = type0_ivm_turn_on ? parity_frame :
+                   pf_write         ? parity_r6 :
+                                      (row_next[0] ^ parity_frame);
+assign ivm_disp  = ivm_disp_r;
+assign line_vma  = {line[3:0], parity_c9};
+
+reg        type0_r4_adjust_switch;
+reg        type0_r9_live_compare;
+reg        type0_r9_at_r0_pending;
+reg        type0_c0_1_adjust;
+reg        type0_r0_zero_entry_consumed;
+reg        type0_zero_adj_entry;
+reg        type0_r5_adjust_override;
+reg  [4:0] type0_r5_adjust_target;
+reg        type0_r0_widen_pending;
+
+// Technical information sourced from the "Amstrad CPC CRTC Compendium" by
+// Longshot (CC BY-NC-ND). ACCC v1.10 section 11.2.2 and v1.11 French section
+// 13.2.1 p.106 specify that an R4 write on a type-0 last line from C0=2 through
+// C0=R0 switches the line-end comparison from C9/R9 to C9/R5 before the next line
+// is calculated if R4 does not remain equal to C4 throughout the line.
+wire       type0_r4_window_write;
+wire       type0_r4_switch_write;
+wire       type0_r9_compare_write;
+wire       type0_r9_pending_r4_cancel = type0_r9_live_compare && in_adj && register_write &&
+                                      (addr == 5'd04) && (DI[6:0] != row);
+wire       type0_r4_switch_active = type0_r4_adjust_switch | type0_r4_switch_write |
+                                   type0_r9_pending_r4_cancel;
+// French ACCC v1.11 section 11.2.2 p.83, example 3: management is
+// already armed, but an R9 write keeps C9/R9 selected until the pending
+// C4 increment. R4's explicit switch takes precedence, including an
+// unequal write restored within the same line (section 13.2.1 p.106).
+wire       type0_r9_compare_active = (type0_r9_live_compare | type0_r9_compare_write) &
+                                   ~type0_r4_switch_active;
+wire       type0_c0_1_break_write = !CRTC_TYPE && register_write && hcc == 1 &&
+									frame_adj_r && !in_adj &&
+									((addr == 5'd04 && DI[6:0] != row) ||
+									 (addr == 5'd09 && DI[4:0] != line));
+wire       type0_c0_1_adjust_active = type0_c0_1_adjust | type0_c0_1_break_write;
+// Include the accepting write: with R0=1 this is also the rollover edge,
+// before type0_r9_live_compare can latch the pending R9 phase.
+wire       type0_c0_1_r9_owner = type0_r9_compare_active ||
+    (type0_c0_1_break_write && addr == 5'd09 && row == R4_v_total &&
+     !type0_r4_switch_active);
+wire       type0_c0_1_r5_owner = type0_c0_1_adjust_active && !type0_c0_1_r9_owner;
+
+// Technical information sourced from the "Amstrad CPC CRTC Compendium" by
+// Longshot (CC BY-NC-ND). French ACCC v1.11 section 13.7.2 pp.126-128:
+// a pre-CLKEN R0=1 -> R0>1 write on C0=1 retains the raster-terminal
+// row increment even without a frame-terminal match. The prior frame arm
+// separately owns continued additional management (§13.7.2.2 p128).
+// Keep the existing direct first-CLKEN route frame-qualified.
+wire       type0_r0_widen_write_eligible = nRESET && !SNA_LOAD && !CRTC_TYPE &&
+									 register_write &&
+									 (addr == 5'd00) && (hcc == 1) &&
+									 (R0_h_total == 1) && (DI > 1) &&
+									 !in_adj &&
+									 (R5_v_total_adj == 0) && (R8_interlace == 0);
+wire       type0_r0_widen_write_accept = type0_r0_widen_write_eligible && frame_adj_r;
+// MODEL LIMIT (B26): the literal early OUT in FR §13.7.2.1 p127 requires
+// the row-only result modeled by this pre-CLKEN ticket for R5=R8=0.
+// Applying that admission
+// to other pre-CLKEN writes (including late OUTI) is an inferred extension.
+// Non-last direct first-CLKEN admission and the old-one horizontal deadline
+// remain unresolved; the existing direct route and sample exclusion stay.
+// See docs/backlog.md B26.
+// French section 13.7.2 p.127: an early write has already updated R0
+// before CLKEN, so C0 must advance 1->2 on that edge, with no duplicate
+// C0=1 character. Retain the vertical action until that edge. The existing
+// direct-CLKEN path still separates its accepting edge from the C0=2 step.
+reg        type0_r0_widen_write_pending;
+wire       type0_r0_widen_accept = CLKEN && type0_r0_widen_write_accept;
+always @(posedge CLOCK) begin
+    if(!nRESET || SNA_LOAD || CRTC_TYPE || CLKEN)
+        type0_r0_widen_write_pending <= 0;
+    else if(type0_r0_widen_write_accept ||
+            (type0_r0_widen_write_eligible && line == R9_v_max_line))
+        type0_r0_widen_write_pending <= 1;
+end
+assign     r0_widen_hold = type0_r0_widen_accept;
+assign     r0_widen_step = (type0_r0_widen_pending || type0_r0_widen_write_pending) &&
+                          !SNA_LOAD && !CRTC_TYPE;
+
+// Type 0 still compares C0 with R0 when both are zero, but that repeated
+// equality pins C0 rather than completing a stream of one-character lines.
+wire       r0_frozen_w = hcc_terminal && !hcc;
+assign     r0_frozen = !CRTC_TYPE && r0_frozen_w;
+
+// F10: the old `& ~interlace` halving of the limit is gone; the IVM limit
+// comparison below replaces it (section 19.8.1).
+wire [4:0] crtc0_line_max = (in_adj ? (R5_v_total_adj - 1'd1) : R9_v_max_line);
+
+// The live IVM-aware line-limit comparison, evaluated at hcc_last by the
+// rollover's live path.
+//
+// F15 (ACCC v1.11 section 19.5.2 pp.206-207, the rendered R9=7 worked
+// example; the p.220 row-end gate adjudicated as `If R9.0=1` in author
+// question Q19): the target is a 6-bit sum.  Switch line: raw C9 against
+// R9 + ParityFrame -- the p.220 prose and its overflow sentence ("If C9=R9
+// and the parity is odd, then the test C9=R9+1 is false") pin the addition
+// form.  Steady IVM lines: the row ends at the first C9.VMA at or past R9,
+// i.e. target R9 + (ParityC9 xor R9.0) -- odd-parity rows end exactly at
+// R9, even-parity rows at R9+1, producing the documented 5/4 line
+// alternation.  For even R9 the addend reduces to ParityC9 and R9+P equals
+// the previous R9-or-P form bit-for-bit, so the t22 vectors are unchanged.
+// Exit/toggle-leave and IVM-off lines: plain R9.  The 6-bit compare keeps
+// an overflowed target (R9=31 with an even addend) unmatchable, preserving
+// the old degenerate no-row-end behavior.
+wire [5:0] type0_limit_addend = tog_line ? (tog_enter_line ? {5'b00000, parity_frame}
+                                                           : 6'd0) :
+                             ivm_disp_r ? {4'b0000, parity_c9 ^ R9_v_max_line[0]} : 6'd0;
+wire [5:0] type0_limit_target6 = {1'b0, R9_v_max_line} + type0_limit_addend;
+// French19.8.1 p221/pp224-225: ivm_disp_r retains the exit line's
+// VMA test until its seam; following ordinary lines compare live raw C9.
+wire [4:0] type0_limit_value = ivm_disp_r ? line_vma : line;
+wire       type0_ivm_limit = ({1'b0, type0_limit_value} == type0_limit_target6);
+
+// ACCC v1.10 section 10.3: C9 uses equality, never magnitude.  A zero limit
+// reached from C9>0 must let C9 run to 31 and wrap, so no unconditional
+// "limit is zero" match may short-circuit the comparison.  Adjustment keeps
+// its plain C9-vs-R5 reuse; outside adjustment the IVM comparison applies.
+wire       line_last = (in_adj && !type0_r9_compare_active) ?
+                       (line == crtc0_line_max) : type0_ivm_limit;
+wire [4:0] type0_r5_adjust_target_effective = type0_r5_window_write ?
+											(DI[4:0] - 1'd1) : type0_r5_adjust_target;
+wire       type0_r5_write = !CRTC_TYPE && register_write && addr == 5'd05;
+wire [4:0] type0_effective_r5 = type0_r5_write ? DI[4:0] : R5_v_total_adj;
+wire       type0_r5_window_write = type0_r5_write && hcc <= 2 &&
+                                  (in_adj || type0_c0_1_r5_owner);
+wire       type0_r5_override_active = (type0_r5_adjust_override | type0_r5_window_write) &
+                                      (in_adj || type0_c0_1_r5_owner);
+wire       type0_zero_adj_entry_active = type0_zero_adj_entry &
+										 ~(type0_r5_write && (hcc <= 2) && (|DI[4:0]));
+wire [4:0] type0_adjust_line_max =
+					(type0_r5_override_active ? type0_r5_adjust_target_effective :
+					 (type0_effective_r5 - 1'd1));
+wire       type0_r9_at_r0_write;
+wire       type0_r9_at_r0_active = type0_r9_at_r0_pending | type0_r9_at_r0_write;
+// Section 10.3.1.1: once `Last Line` is false, the rollover uses the live
+// C9/R9 comparison rather than the value latched at C0=0.  That is what makes
+// the section 12.2.1 first-line RLAL sequence (R9=0 written after the C0<2
+// window) increment C4 on the very next line.
+// F10 (section 19.8.1): the live comparison is the IVM-aware limit test;
+// with IVM off it reduces to the plain C9==R9 equality.  This is the path
+// mid-line R8 toggles act through: the exit line's doubled-value-vs-plain-R9
+// form and the switch line's raw-value-vs-R9-or-ParityFrame form are both
+// carried by type0_ivm_limit's per-line bits.
+wire       type0_live_line_last = type0_ivm_limit;
+wire       type0_last_line_armed = line_last_r & row_last_r;
+// C0=1 is the rollover too when R0=1: consume the admitted live
+// validation on that edge, before the wrapper's shared latches update.
+// French §12.2 p95 and §11.2.2 p83 / §13.2.4 p108: an R4 break
+// already selected R5 on this current additional line. Its calculated next
+// C9 may reach the selected target at the first boundary. Pending R9 owns
+// a different comparator and must not take this completion path.
+wire       type0_c0_1_r5_end = type0_c0_1_r5_owner &&
+                              (line == type0_adjust_line_max);
+// French §11.2.2 p83 and §13.2.4 p108: pending C4=R4 still owns
+// R9 on the first forced additional line. A pre-R0 restoration can
+// match it at this boundary. The accepting C0=1 edge and exact-R0
+// write keep their existing distinct rollover priorities.
+wire       type0_c0_1_r9_match = type0_c0_1_adjust && type0_c0_1_r9_owner &&
+                               !type0_r9_at_r0_active && type0_live_line_last;
+wire       type0_rollover_line_last = type0_c0_1_adjust_active ?
+                                     (type0_c0_1_r5_end | type0_c0_1_r9_match) :
+                                    c1_last_line_validate ? 1'b1 :
+									 type0_r9_at_r0_active ?
+									 (line == type0_adjust_line_max) :
+								 type0_r4_switch_active ?
+									 (line == type0_adjust_line_max) :
+								 type0_r9_compare_active ? type0_live_line_last :
+								 type0_r5_override_active ?
+									 ((line == type0_adjust_line_max) | type0_zero_adj_entry_active) :
+								 (in_adj | type0_last_line_armed) ? line_last_r :
+									 type0_live_line_last;
+// French ACCC v1.11 §11.2.2 pp82–83 and §13.2.4 p108:
+// while the pending C4=R4 phase still compares R9, its C9 reset already
+// calculates the next line. If that zero reaches the selected R5=0 target,
+// adjustment ends before displaying an extra C4=R4+1/C9=0 line.
+wire       type0_r9_zero_adjust_end = (in_adj | type0_c0_1_r9_match) &&
+                                     type0_r9_compare_active &&
+                                     type0_rollover_line_last &&
+                                     (type0_adjust_line_max == 5'd31);
+wire       type0_adjust_end = type0_r9_zero_adjust_end | type0_c0_1_r5_end;
+wire       type0_rollover_row_last = type0_r9_at_r0_active ? line_last_r :
+									 type0_rollover_line_last;
+
+assign line_new = hcc_terminal && !r0_frozen_w && !type0_r0_widen_accept;
+// F14: on the intercept edge the "line" that starts is the additional one;
+// its C9 continues the adjustment count to R5 (section 11.2 p.85).
+assign line_next = type0_add_intercept ? R5_v_total_adj :
+                   type0_rollover_line_last ? 5'd0 : line + 5'd1;
+assign c5_next = 5'd0;
+
+// ACCC v1.10 section 12: outside vertical adjustment C4 is equality-compared
+// too.  Type 0's R4=0 frame end comes from the `Last Line` / adjustment
+// arbitration above, not from a magnitude special case.
+wire       row_last_w = (row == R4_v_total);
+// French ACCC v1.11 sections 10.3.1.2 p.77 and 12.2 pp.94-95:
+// a frame reset consumes the combined Last Line decision. C4==R4 alone
+// cannot reset a frame after an early R9 write cancelled that decision.
+wire       crtc0_row_frame_last = (type0_last_line_armed | in_adj) &
+                                      (~type0_adjustment_selected | type0_adjust_end) &
+                                      (~type0_r9_compare_active | type0_r9_zero_adjust_end);
+// F14 (ACCC v1.11 section 19.6.1 p.217; Q10 resolution in
+// accc-author-questions.md item 10): with an interlace mode active (R8=1 or
+// 3) and ParityR6 odd, one additional line is appended after the R5
+// adjustment lines -- directly after the last character row when R5=0 --
+// before the frame origin.  ParityR6 is captured when C4 reaches R6 and
+// freezes when C4 cannot reach R6 (ordinary R6>R4 geometry, §19.5.2
+// p.206), so the gate persists: a line
+// every frame if frozen odd, never if frozen even (section 19.6.1 p.217).
+// C4 is incremented only once for the whole additional-lines period and
+// equals R4+1 there (section 19.6.1 p.217): the adjustment-entry increment
+// to R4+1 (section 11.2.2 p.82) already covers the R5 lines, so the
+// additional line holds C4=R4+1 and continues the adjustment count at
+// C9=R5 -- "the counting is done as if this line had been added to R5"
+// (section 11.2 p.85).  The frame origin (C4=C9=C0=0, ParityFrame snapshot,
+// VMA reload) moves to the end of that line; its duration counts in the
+// following odd frame (section 19.3 p.200).
+wire       type0_add_armed = R8_interlace[0] && parity_r6;
+reg        type0_add_line_active;
+wire       type0_frame_end_raw = row_new & crtc0_row_frame_last;
+wire       type0_add_intercept = type0_frame_end_raw && !type0_add_line_active &&
+								 type0_add_armed;
+assign     frame_adj = ((type0_adjustment_selected | type0_r9_compare_active) &
+                        ~type0_adjust_end) |
+                       c1_last_line_validate |
+                       type0_add_intercept;
+assign     row_frame_last = crtc0_row_frame_last & ~type0_add_intercept;
+assign     row_next = type0_add_intercept ? (in_adj ? row : row + 7'd1) :
+									 row_frame_last ? 7'd0 : row + 1'd1;
+assign     row_new = line_new & type0_rollover_row_last;
+wire       frame_new_w = row_new & row_frame_last;
+
+// Type-0 parity rules (section 19.5.2 p.206): ParityFrame snapshots
+// ParityR6 at the frame origin (C4=C9=C0=0); ParityR6 captures
+// ParityFrame xor 1 when C4 reaches R6 -- independent of R8, frozen when
+// C4 cannot reach R6 (ordinary R6>R4 geometry). The frame origin is excluded
+// from the R6 capture (same convention as the R6-border-condition
+// exclusion at C4=C9=C0=0).  The p.220 pseudocode's alternative frame-end
+// toggle (ParityFrame ^= ParityR6 when C4==R4) is equivalent to this
+// snapshot at the origin and is not duplicated here.
+assign pf_write  = frame_new_w;
+assign pf_value  = parity_r6;
+// French §19.5.2 p206: capture a C4 landing, independently of DE.
+// MODEL LIMIT (B26): retain pre-edge !in_adj and ordinary origin policy;
+// off-seam zero/zero parity is unmeasured, so preserve its old behavior
+// independently of the display conflict rule. R4/R7 off-seam consumers
+// and adjustment/IVM landing generalization are not resolved by this R6 proof.
+assign pr6_write = row_r6_landing && !frame_new_w && !in_adj &&
+                   (row_new || !(R6_v_displayed == 0 && line == 0));
+assign pr6_value = parity_frame ^ 1'd1;
+
+wire       type0_r4_at_c0_write = register_write && addr == 5'd04 && hcc < 2;
+wire       type0_r9_at_c0_write = register_write && addr == 5'd09 && hcc < 2;
+wire       type0_r5_at_c0_write = type0_r5_write && hcc == 0;
+wire [6:0] type0_c0_r4 = type0_r4_at_c0_write ? DI[6:0] : R4_v_total;
+// ACCC v1.11 §12.2 (pp. 93–95): on CRTC 0, evaluating whether C9==R9 and
+// C4==R4 at C0<2 uses the updated value if R4 or R9 is modified at C0<2
+// (unlike CRTC 2 §12.4.1 p.96 where R9 arrives too late for C0=0).
+wire [4:0] type0_c0_r9 = type0_r9_at_c0_write ? DI[4:0] : R9_v_max_line;
+wire [4:0] type0_c0_r5 = type0_r5_at_c0_write ? DI[4:0] : R5_v_total_adj;
+wire [4:0] type0_c0_adjust_line_max = (type0_c0_r5 - 1'd1);
+wire       type0_c0_zero_adj_entry = type0_zero_adj_entry & ~(type0_r5_at_c0_write & (|DI[4:0]));
+// The C0=0 seam evaluates `Last Line` against the effective (possibly
+// same-edge written) R4/R9 per section 12.2 p.93. Both are plain equalities:
+// ordinary value that only matches a counter already at zero.  F10: the
+// seam forms the new line's IVM comparison from the live R8 register (the
+// mode that line will run) and the still-pending toggle status; with IVM
+// off it reduces to the plain C9==R9 equality.  F15: the same 6-bit
+// R9-plus-addend target form as the live comparison above, with the seam's
+// own toggle/IVM bits.
+wire       type0_seam_ivm = (R8_interlace == 2'b11);
+wire [4:0] type0_seam_value = type0_seam_ivm ? line_vma : line;
+wire [5:0] type0_seam_addend = tog_line ? (tog_enter_line ? {5'b00000, parity_frame}
+                                                          : 6'd0) :
+                             type0_seam_ivm ? {4'b0000, parity_c9 ^ R9_v_max_line[0]} : 6'd0;
+wire [5:0] type0_seam_target6 = {1'b0, type0_c0_r9} + type0_seam_addend;
+wire       type0_c0_row_last = (row == type0_c0_r4);
+// F14: on the additional line (C9=R5) the seam must latch the row-end so
+// the line ends at the frame origin; the plain adjustment limit (R5-1)
+// cannot match there.
+wire       type0_c0_line_last = (in_adj && !type0_r9_compare_active) ? (((type0_add_line_active && (line == type0_c0_r5)) |
+											(line == type0_c0_adjust_line_max)) | type0_c0_zero_adj_entry) :
+										(({1'b0, type0_seam_value} == type0_seam_target6));
+assign     c0_line_last = type0_c0_line_last;
+assign     c0_row_last = type0_c0_row_last;
+// French ACCC v1.11 section 12.2 pp.94-95: false Last Line can become
+// true at C0=1 as well as C0=0. A C0=1 break already entered adjustment;
+// retain that distinct route instead of treating a restoring write as
+// a new last-frame-line decision. Active adjustment owns its own count.
+// Section19.8.1 p220: an R8 write changes the value interpretation
+// only after this line's comparison. C0=1 therefore uses the current
+// line's IVM value, not the next-seam mode from live R8.
+// Target parity is immediate on an R8 write, including this edge;
+// steady-IVM target parity follows the effective new R9 (19.5.2 p207).
+wire       type0_c1_toggle = tog_line || r8_toggle_write_t0;
+wire       type0_c1_enter = r8_toggle_write_t0 ? (DI[1:0] == 2'b11) : tog_enter_line;
+wire [5:0] type0_c1_limit_addend = type0_c1_toggle ?
+                                 (type0_c1_enter ? {5'b00000, parity_frame} : 6'd0) :
+                                 ivm_disp_r ? {4'b0000, parity_c9 ^ type0_c0_r9[0]} : 6'd0;
+wire [5:0] type0_c1_limit_target = {1'b0, type0_c0_r9} + type0_c1_limit_addend;
+wire       type0_c1_line_last = ({1'b0, type0_limit_value} == type0_c1_limit_target);
+assign     c1_last_line_validate = !CRTC_TYPE && (hcc == 1) && !in_adj &&
+                                  !type0_c0_1_adjust_active &&
+                                  type0_c1_line_last && type0_c0_row_last;
+
+wire       type0_adjustment_selected = type0_c0_1_adjust_active |
+									 ((hcc == 2) ?
+									  frame_adj_r & |type0_effective_r5 : frame_adj_r);
+assign type0_r4_window_write = !CRTC_TYPE && register_write && addr == 5'd04 &&
+								  hcc >= 2 && hcc <= R0_h_total &&
+								  type0_adjustment_selected && !in_adj;
+assign type0_r4_switch_write = type0_r4_window_write && DI[6:0] != row;
+assign type0_r9_compare_write = !CRTC_TYPE && register_write && addr == 5'd09 &&
+								  hcc >= 2 && hcc < R0_h_total &&
+								  type0_adjustment_selected && !in_adj;
+assign type0_r9_at_r0_write = !CRTC_TYPE && register_write && addr == 5'd09 &&
+								 hcc_last && hcc >= 2 && type0_adjustment_selected && !in_adj;
+
+assign in_adj_route = !CRTC_TYPE && line_new && !type0_adjust_end &&
+                                             (type0_r4_switch_active | type0_r9_compare_active |
+												type0_c0_1_adjust_active);
+
+// ACCC v1.10 sections 11.2.2 and 13.2.1/13.2.6: on the first repeated C0=0,
+// C9 freezes but a matching C9/R9 consumes the already-armed C4 increment
+// exactly once. A simultaneous C4/R4 match enters the short-R0 default
+// adjustment route.
+assign frozen_row_advance = !CRTC_TYPE && r0_frozen && !in_adj &&
+	!type0_r0_zero_entry_consumed && line == R9_v_max_line;
+
+assign hcc2_adj_keep = |type0_effective_r5;
+
+assign reload = ~CRTC_TYPE & frame_new_w;
+assign row_addr_save = hcc == R1_h_displayed && type0_live_line_last;
+
+// F14 additional-line state: set on the intercept edge (the would-be frame
+// origin), cleared by the true origin that ends the additional line.  The
+// intercept priority in the if-chain matters: on the intercept edge itself
+// frame_new_w is masked to 0, but the raw end condition is what armed it.
+// CLKEN-gated: both terms are levels true across the whole hcc_last
+// character, so an ungated flop would toggle on every clock edge and feed
+// the oscillation back through the parity block.
+always @(posedge CLOCK) begin
+	if(~nRESET | SNA_LOAD | CRTC_TYPE) type0_add_line_active <= 0;
+	else if(CLKEN && type0_add_intercept) type0_add_line_active <= 1;
+	else if(CLKEN && frame_new_w) type0_add_line_active <= 0;
+end
+
+// Register writes are clocked at the 16 MHz bus rate, not only on CLKEN.
+// Retain the selected comparator for the rest of the current character line.
+always @(posedge CLOCK) begin
+	if(~nRESET | SNA_LOAD | CRTC_TYPE) begin
+		type0_r4_adjust_switch <= 0;
+		type0_r9_live_compare <= 0;
+		type0_r9_at_r0_pending <= 0;
+		type0_c0_1_adjust <= 0;
+		type0_r0_zero_entry_consumed <= 0;
+		type0_zero_adj_entry <= 0;
+		type0_r5_adjust_override <= 0;
+		type0_r5_adjust_target <= 0;
+		type0_r0_widen_pending <= 0;
+	end
+	else begin
+		// The accepting edge is not a real line boundary: hold C0=1 and
+		// remember the already-evaluated last-line action.  One character
+		// later the wrapper advances into C0=2, increments C4 without
+		// resetting C9, and consumes this private state.  Snapshot load and a
+		// live switch away from type 0 discard the pending transition above.
+		if(type0_r0_widen_accept)
+			type0_r0_widen_pending <= 1;
+		else if(CLKEN && type0_r0_widen_pending)
+			type0_r0_widen_pending <= 0;
+		// French ACCC v1.11 section 13.2.1 p.106: vertical adjustment with
+		// ordinary C4=R4+1 progression requires R4 to have remained equal to
+		// C4 throughout the line. Any unequal R4 write within C0 in [2, R0]
+		// sets type0_r4_adjust_switch sticky for the rest of the line; an
+		// equal restoring write must not clear the current-line history.
+		if(CLKEN && line_new) type0_r4_adjust_switch <= 0;
+		else if(type0_r4_switch_write || type0_r9_pending_r4_cancel)
+			type0_r4_adjust_switch <= 1;
+		if(type0_r4_switch_active) type0_r9_live_compare <= 0;
+		// French ACCC v1.11 §12.2 p95, §11.2.2 p83 example 3 and
+		// §13.2.4 p108: a C0=1 R9 break enters adjustment on this line,
+		// retaining C9/R9 while C4=R4. An R4 break selects R5 instead;
+		// later R9 writes cannot start a new pending phase after that.
+		else if((type0_c0_1_break_write && addr == 5'd09 && row == R4_v_total) ||
+				(type0_r9_compare_write && !type0_c0_1_adjust_active))
+			type0_r9_live_compare <= 1;
+		// Consume the pending R9 comparator when C4 advances, including
+		// a restored match on the first boundary. An unequal R4 write above
+		// selects R5 even if R4 is subsequently restored to C4.
+		else if(CLKEN && row_new) type0_r9_live_compare <= 0;
+		if(type0_r9_at_r0_write) type0_r9_at_r0_pending <= 1;
+		else if(CLKEN && line_new) type0_r9_at_r0_pending <= 0;
+		// A line boundary consumes the current-line override.  An accepted
+		// write on that same edge still affects the combinational rollover
+		// through type0_r5_adjust_target_effective, but must not leak into the
+		// next line's state.
+		if(CLKEN && line_new) begin
+			type0_r5_adjust_override <= 0;
+			type0_r5_adjust_target <= 0;
+		end
+		// Keep the forced current line's selected R5 target through late
+		// writes; C0<=2 writes below can still replace it. A coincident
+		// short-R0 boundary consumes it in the line_new branch above.
+		else if(type0_c0_1_break_write && addr == 5'd04) begin
+			type0_r5_adjust_override <= 1;
+			type0_r5_adjust_target <= R5_v_total_adj - 5'd1;
+		end
+		else if(type0_r5_window_write) begin
+			type0_r5_adjust_override <= 1;
+			type0_r5_adjust_target <= DI[4:0] - 1'd1;
+		end
+		// A C0=1 write can also be the R0=1 rollover. Its combinational
+		// effect is consumed on that edge and must not leak into the next line.
+		if(CLKEN && line_new) type0_c0_1_adjust <= 0;
+		else if(type0_c0_1_break_write) type0_c0_1_adjust <= 1;
+		if(!r0_frozen_w) type0_r0_zero_entry_consumed <= 0;
+		else if(CLKEN) type0_r0_zero_entry_consumed <= 1;
+		if(type0_r5_write && (hcc <= 2) && (|DI[4:0])) type0_zero_adj_entry <= 0;
+
+		if(CLKEN) begin
+			if(line_new && (type0_r4_switch_active | type0_r9_compare_active |
+							type0_c0_1_adjust_active))
+				// French §12.2 p95 and §13.2.4 p108: forced C0=1
+				// entry counts calculated C9 to R5. The one-extra-line flag
+				// below belongs only to unmodified short-R0 entry (§13.2.1 p106).
+				type0_zero_adj_entry <= 0;
+			else if(r0_frozen_w && !in_adj && !type0_r0_zero_entry_consumed &&
+					line == R9_v_max_line && row == R4_v_total)
+				type0_zero_adj_entry <= !(|R5_v_total_adj);
+			else if(row_new) begin
+				if(frame_adj)
+					type0_zero_adj_entry <= !(|type0_effective_r5);
+				else if(frame_new_w)
+					type0_zero_adj_entry <= 0;
+			end
+		end
+	end
+end
+
+// Partial first line of a VSYNC started by an R7=C4 write after C0=1: the
+// count tick that ends the write character must not consume the first C3h
+// unit (ACCC v1.10 sections 14.2 and 16.4.1). Cleared while another type is
+// selected or a snapshot loads; never carried across either boundary.
+reg        type0_vsync_wait_line_start;
+
+// English ACCC v1.11 section 16.4.1.2 p.169 (FR §16.4.1.2 p.170, confirmed
+// normative by the author on 2026-08-31): C0 must actually reach 2 on the
+// line preceding C4=R7.  This is line history, not a test of the live R0
+// register: changing R0 from >2 to 0 or 1 at C0=0 of the target line retains
+// the qualifying preceding line and therefore still starts VSYNC as documented.
+reg type0_vsync_c0_2_seen;
+reg type0_vsync_preceding_c0_2;
+// The live value also reconstructs history after a lifecycle clear: if the
+// retained latch was cleared at C0>2, this line necessarily passed C0=2.
+wire type0_vsync_line_reached_c0_2 = type0_vsync_c0_2_seen || (hcc >= 8'd2);
+wire type0_vsync_field_c0_2 = type0_vsync_preceding_c0_2 ||
+								 type0_vsync_line_reached_c0_2;
+assign vsync_c0_2_qualified = vsync_mid_phase ? type0_vsync_field_c0_2 :
+									 type0_vsync_line_reached_c0_2;
+
+always @(posedge CLOCK) begin
+	if(~nRESET | SNA_LOAD | CRTC_TYPE) begin
+		type0_vsync_c0_2_seen <= 0;
+		type0_vsync_preceding_c0_2 <= 0;
+	end
+	else if(CLKEN) begin
+		if(line_new) begin
+			type0_vsync_preceding_c0_2 <= type0_vsync_line_reached_c0_2;
+			type0_vsync_c0_2_seen <= 0;
+		end
+		else if(hcc == 8'd2) begin
+			type0_vsync_c0_2_seen <= 1;
+		end
+	end
+end
+
+wire vsync_count_tick_t0 = CLKEN &&
+	(vsync_mid_phase ? (!r0_frozen_w && (hcc_next == {1'b0, R0_h_total[7:1]})) : line_new);
+
+assign field_count_tick = !r0_frozen_w && (hcc_next == {1'b0, R0_h_total[7:1]});
+
+wire r7_write_hit = ENABLE & RS & ~nCS & ~R_nW & addr == 5'd07;
+wire r7_write_fire_t0 = !VSYNC_r && vsync_allow && (hcc > 1);
+assign r7_write_fire = r7_write_fire_t0;
+assign vsync_holdoff = !CRTC_TYPE && type0_vsync_wait_line_start;
+
+always @(posedge CLOCK) begin
+	if(~nRESET) begin
+		type0_vsync_wait_line_start <= 0;
+	end
+	else begin
+		if(vsync_count_tick_t0) begin
+			if(!CRTC_TYPE && type0_vsync_wait_line_start)
+				type0_vsync_wait_line_start <= 0;
+		end
+		if(r7_write_hit) begin
+			if(row != DI[6:0]) begin
+				// A false comparison re-arms only; the holdoff latch is
+				// untouched outside the equal-comparison branch.
+			end
+			else if(r7_write_fire_t0)
+				type0_vsync_wait_line_start <= !vsync_count_tick_t0;
+			else if(!VSYNC_r) begin
+				type0_vsync_wait_line_start <= 0;
+			end
+		end
+		if(CRTC_TYPE || SNA_LOAD) type0_vsync_wait_line_start <= 0;
+	end
+end
+
+// ACCC v1.10 section 21.3: with R6=0 the display toggles border/display each
+// character at frame origin instead of latching a stable state.
+assign vde_toggle = !CRTC_TYPE && row == 0 && line == 0 && R6_v_displayed == 0;
+
+// F15 (ACCC v1.11 section 19.5.2 pp.206-207): with R9 odd (the balancing
+// scheme active) and R7 on an odd C4, the ParityFrame-odd frame delays the
+// VSYNC by one line -- it fires at the second line of C4=R7, where
+// C9.VMA=2, so the pulse lands at the same physical line offset on both
+// frames.  Even R7 needs no correction (the frames already agree); the
+// delay is keyed on ParityFrame, not on the legacy field flop.
+// Two staged line-granular flops, advanced at each line end:
+//   d1 -- set where the natural fire was due and the arm holds; suppresses
+//         the natural fires for the next line (the first line of C4=R7)
+//         and fires the seam path at its end, so the pulse starts at the
+//         second line's seam;
+//   d2 -- retains the following-line half-count event for the legacy
+//         R8-exit lifecycle. In steady IVM the odd-parity pulse uses d1
+//         at the seam; d2 is not its normal start path.
+// French ACCC v1.11 section 11.2.2 p.83 example 2 holds C4 when an R4
+// write selects C9/R5, even if the live C9/R9 comparison still matches.
+// Section 16.4.1 p.170 starts VSYNC when C4 reaches R7: consume the
+// canonical row commit, not a prospective row_next that rollover discards.
+wire       vsync_fire_seam_raw = row_new && (row_next == R7_v_sync_pos);
+wire       vsync_fire_seam = vsync_fire_seam_raw && type0_vsync_line_reached_c0_2;
+// Non-interlace consumes a blocked comparison at the row-entry seam.  In a
+// field the comparison is consumed at its half-line count point, using either
+// retained history or C0=2 reconstructed on the current lifecycle-reset line.
+assign vsync_line_blocked = vsync_mid_phase ?
+	((row == R7_v_sync_pos) && !line && !type0_vsync_field_c0_2) :
+	(vsync_fire_seam_raw && !type0_vsync_line_reached_c0_2);
+wire       type0_vsync_delay_arm = R9_v_max_line[0] && ivm_disp_r &&
+                                   R7_v_sync_pos[0] && parity_frame && !in_adj;
+reg        type0_vsync_delay_d1;
+reg        type0_vsync_delay_d2;
+always @(posedge CLOCK) begin
+	if(~nRESET | SNA_LOAD | CRTC_TYPE) begin
+		type0_vsync_delay_d1 <= 0;
+		type0_vsync_delay_d2 <= 0;
+	end
+	else if(CLKEN && hcc_terminal && !type0_r0_widen_accept) begin
+		type0_vsync_delay_d1 <= vsync_fire_seam && type0_vsync_delay_arm;
+		type0_vsync_delay_d2 <= type0_vsync_delay_d1;
+	end
+end
+assign vsync_line_fire = (vsync_fire_seam && !type0_vsync_delay_arm) ||
+                         type0_vsync_delay_d1;
+// Both delay outputs are qualified with the type selection: the clearing
+// edge of an armed d1/d2 is the first CLOCK edge after a live switch to
+// type 1, and the wrapper samples the pre-edge value on that same edge --
+// without the qualifier a type-1 field count tick landing exactly there
+// would see the stale suppress and lose its natural VSYNC fire (review
+// blocking 1, 2026-08-26).
+assign vsync_delay_suppress = !CRTC_TYPE && type0_vsync_delay_d1;
+assign vsync_delay_half = !CRTC_TYPE && type0_vsync_delay_d2;
+assign vsc_load = R3_v_sync_width - 1'd1;
+
+assign hsync_off = (hsc == R3_h_sync_width);
+assign de_index = R8_skew;
+
+// Technical information sourced from the "Amstrad CPC CRTC Compendium" by
+// Longshot (CC BY-NC-ND). ACCC v1.11 section 17.6.2 p.187 (FR p.188): when R1>R0 the
+// C0=R1 DISPTMG-off comparison can never fire (C0 wraps at R0 first), so a
+// type-0 CRTC substitutes C0=R0 as the border-start trigger. The wrapper uses
+// nCLKEN to narrow this condition to the documented second 0.5 us of C0=R0.
+// Section 19.2.4 p.196 (FR p.196): a programmed SKEW-DISPTMG delay is counted from the
+// substituted trigger, so the wrapper injects it ahead of the delay line;
+// mode 2'b11 (non-output) suppresses it entirely.
+// The term is combinational by intent: section 17.3 has the C0=R1
+// comparison evaluate live, so the substitution tracks live R1/R0 writes
+// too. Gated on !CRTC_TYPE because type 1 emits no border byte at all in
+// this configuration (ACCC pp.187-188, FR pp.188-189; section 28.1.6 discriminator). With
+// R0=0 the half-phase gate naturally produces the p.187 (FR p.188) alternating display /
+// border bytes while C0 remains pinned at zero.
+assign spurious_border_off = !CRTC_TYPE &&
+							 (R1_h_displayed > R0_h_total) &&
+							 (hcc == R0_h_total);
+
+// nCLKEN R6-write handling: type 0 clears the delayed display-enable latch
+// unless the write lands on the frame-origin toggle point.
+assign r6_vder_write = (row == DI[6:0]) && !(row == 0 && line == 0);
+assign r6_vder_value = 1'b0;
+
+endmodule

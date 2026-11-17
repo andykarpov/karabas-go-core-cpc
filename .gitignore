@@ -78,3 +78,11 @@ _xmsgs/
 src/sim/build/
 src/kg_*.stamp
 src/measure/xst.log
+
+src/measure/xst_h.log
+src/measure/h.xst
+src/xstc/
+src/xsth/
+src/measure/xst_classic.log
+!src/measure/cpc_measure_classic.prj
+!src/measure/cpc_measure_classic.xst
