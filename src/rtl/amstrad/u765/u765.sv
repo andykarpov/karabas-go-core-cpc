@@ -367,7 +367,7 @@ always @(posedge clk_sys) begin : fdc
 	reg [7:0] i_byte_clk_cnt;
 	reg       i_byte_clk_en;
 
-	reg [7:0] i_current_track_sectors[2][2]; // sectors/track
+	reg [7:0] i_current_track_sectors[4]; // sectors/track, index {drive, head} // karabas: was [2][2] (XST made tristates of the 2-D writes)
 	reg [7:0] i_current_sector_pos[2][2]; //sector where the head currently positioned
 	reg [7:0] i_next_sector_pos[2][2];    //next sector where the head will positioned
 	reg       i_secinfo_valid[2][2];
@@ -600,7 +600,7 @@ always @(posedge clk_sys) begin : fdc
 				$display("reload trackinfo: drive %d track %d", i_current_drive, pcn[i_current_drive]);
 				if (!tinfo_lock) begin
 					sector_byte_pos[i_current_drive] <= '{ 0, 0 };
-					i_current_track_sectors[i_current_drive] <= '{ 0, 0 };
+					begin i_current_track_sectors[{i_current_drive, 1'b0}] <= 0; i_current_track_sectors[{i_current_drive, 1'b1}] <= 0; end // karabas: 1-D
 					next_weak_sector[i_current_drive] <= 0;
 					image_track_offsets_addr <= { i_current_drive, pcn[i_current_drive], 1'b0 };
 					tinfo_ds0 <= i_current_drive;
@@ -618,7 +618,7 @@ always @(posedge clk_sys) begin : fdc
 					seek_state[i_current_drive] <= 5;
 				end else begin
 					$display("reload trackinfo: empty track");
-					i_current_track_sectors[i_current_drive][tinfo_hds] <= 0;
+					i_current_track_sectors[{i_current_drive, tinfo_hds}] <= 0;
 					tinfo_lock <= 0;
 					image_trackinfo_dirty[i_current_drive] <= 0;
 					seek_state[i_current_drive] <= 0;
@@ -645,7 +645,7 @@ always @(posedge clk_sys) begin : fdc
 
 			7:
 			if (!tinfo_wait) begin
-				i_current_track_sectors[i_current_drive][tinfo_hds] <= tinfo_data;
+				i_current_track_sectors[{i_current_drive, tinfo_hds}] <= tinfo_data;
 
 				//assume the head position is at the start of a track after a seek
 				if (i_current_sector_pos[i_current_drive][tinfo_hds] >= tinfo_data) begin
@@ -699,7 +699,7 @@ always @(posedge clk_sys) begin : fdc
 				// TrackInfo+256bytes, and another +256 bytes if sectors/track > 29 -
 				// Simon Owen's extension for Puffy's Saga and other Rubi's protected EDSK files
 				sector_offset[sector_search_ds0][sector_search_hds] <=
-					{image_track_offsets_in + ((i_current_track_sectors[sector_search_ds0][sector_search_hds] > 29) ? 2'd2 : 2'd1), 8'd0};
+					{image_track_offsets_in + ((i_current_track_sectors[{sector_search_ds0, sector_search_hds}] > 29) ? 2'd2 : 2'd1), 8'd0};
 				tinfo_addr <= {image_track_offsets_in[0], 8'h14}; //sector size
 				tinfo_hds <= sector_search_hds;
 				tinfo_ds0 <= sector_search_ds0;
@@ -762,7 +762,7 @@ always @(posedge clk_sys) begin : fdc
 				i_current_sector_pos[sector_search_ds0][sector_search_hds] <= i_next_sector_pos[sector_search_ds0][sector_search_hds];
 				sector_end_pos[sector_search_ds0][sector_search_hds] <= SECTOR_SIZE(sector_n[sector_search_ds0][sector_search_hds], sector_length[sector_search_ds0][sector_search_hds]) + SECTOR_EXTRA_DATA_LEN - 1;
 				sector_search_state <= 0;
-			end else if (i_current_sector == i_current_track_sectors[sector_search_ds0][sector_search_hds] - 1) begin
+			end else if (i_current_sector == i_current_track_sectors[{sector_search_ds0, sector_search_hds}] - 1) begin
 				$display("sector no. %d not found!", i_next_sector_pos[sector_search_ds0][sector_search_hds]);
 				//this shouldn't happen
 				i_secinfo_valid[sector_search_ds0][sector_search_hds] <= 1;
@@ -795,8 +795,8 @@ always @(posedge clk_sys) begin : fdc
 					sector_byte_pos[i_current_drive][i] <= sector_byte_pos[i_current_drive][i] + 1'd1;
 
 					if (sector_byte_pos[i_current_drive][i] >= (sector_end_pos[i_current_drive][i] + gap3[i_current_drive][i])) begin
-						if ((i_current_sector_pos[i_current_drive][i] == i_current_track_sectors[i_current_drive][i] - 1'd1) ||
-						 (i_current_track_sectors[i_current_drive][i] == 0))
+						if ((i_current_sector_pos[i_current_drive][i] == i_current_track_sectors[{i_current_drive, i[0]}] - 1'd1) ||
+						 (i_current_track_sectors[{i_current_drive, i[0]}] == 0))
 						begin
 							// end of last sector
 							if (i_rpm_timer[i_current_drive][i] >= TRACK_TIME) begin
@@ -1005,7 +1005,7 @@ always @(posedge clk_sys) begin : fdc
 					m_status[UPD765_MAIN_EXM] <= 1;
 					m_status[UPD765_MAIN_DIO] <= 1;
 				end
-				if (i_current_track_sectors[ds0][hds] == 0) begin
+				if (i_current_track_sectors[{ds0, hds}] == 0) begin
 					//empty track
 					i_sector_c <= pcn[ds0];
 					i_sector_h <= {7'd0, hds};
@@ -1086,7 +1086,7 @@ always @(posedge clk_sys) begin : fdc
 					if (i_rtrack) i_r <= 0;
 					// If the current track is empty/unformatted (or intentionally treated as empty),
 					// do not enter the sector scan/data state machine. Return an error immediately.
-					if (i_current_track_sectors[ds0][hds] == 0) begin
+					if (i_current_track_sectors[{ds0, hds}] == 0) begin
 						i_sector_c <= i_c;
 						i_sector_h <= i_h;
 						i_sector_r <= i_r;
@@ -1126,7 +1126,7 @@ always @(posedge clk_sys) begin : fdc
 					sector_length[ds0][hds]);
 				end
 
-				if ((i_current_sector_pos[ds0][hds] == i_current_track_sectors[ds0][hds] - 1) &&
+				if ((i_current_sector_pos[ds0][hds] == i_current_track_sectors[{ds0, hds}] - 1) &&
 				    (sector_byte_pos[ds0][hds] == (sector_end_pos[ds0][hds] + gap3[ds0][hds] - 1)) &&
 					(ds0 == i_current_drive)) begin
 					$display("passed index mark, pass: %d", i_scanning);

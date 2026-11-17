@@ -254,7 +254,7 @@ module u765 (
 		reg [3:0] i_step_state [0:1];
 		reg [7:0] i_byte_clk_cnt;
 		reg i_byte_clk_en;
-		reg [15:0] i_current_track_sectors [0:1];
+		reg [7:0] i_current_track_sectors [0:3];
 		reg [15:0] i_current_sector_pos [0:1];
 		reg [7:0] i_next_sector_pos [0:1][0:1];
 		reg [3:0] i_secinfo_valid;
@@ -489,7 +489,8 @@ module u765 (
 					$display("reload trackinfo: drive %d track %d", i_current_drive, pcn[(1 - i_current_drive) * 8+:8]);
 					if (!tinfo_lock) begin
 						sector_byte_pos[i_current_drive] <= 34'h000000000;
-						i_current_track_sectors[i_current_drive] <= 16'h0000;
+						i_current_track_sectors[{i_current_drive, 1'b0}] <= 0;
+						i_current_track_sectors[{i_current_drive, 1'b1}] <= 0;
 						next_weak_sector[i_current_drive] <= 0;
 						image_track_offsets_addr <= {i_current_drive, pcn[(1 - i_current_drive) * 8+:8], 1'b0};
 						tinfo_ds0 <= i_current_drive;
@@ -507,7 +508,7 @@ module u765 (
 						end
 						else begin
 							$display("reload trackinfo: empty track");
-							i_current_track_sectors[i_current_drive][(1 - tinfo_hds) * 8+:8] <= 0;
+							i_current_track_sectors[{i_current_drive, tinfo_hds}] <= 0;
 							tinfo_lock <= 0;
 							image_trackinfo_dirty[i_current_drive] <= 0;
 							seek_state[(1 - i_current_drive) * 3+:3] <= 0;
@@ -531,7 +532,7 @@ module u765 (
 					end
 				7:
 					if (!tinfo_wait) begin
-						i_current_track_sectors[i_current_drive][(1 - tinfo_hds) * 8+:8] <= tinfo_data;
+						i_current_track_sectors[{i_current_drive, tinfo_hds}] <= tinfo_data;
 						if (i_current_sector_pos[i_current_drive][(1 - tinfo_hds) * 8+:8] >= tinfo_data) begin
 							i_next_sector_pos[i_current_drive][tinfo_hds] <= 0;
 							i_rpm_timer[i_current_drive][tinfo_hds] <= 0;
@@ -579,7 +580,7 @@ module u765 (
 				2:
 					if (~tinfo_wait) begin
 						i_current_sector <= 0;
-						sector_offset[sector_search_ds0][sector_search_hds] <= {image_track_offsets_in + (i_current_track_sectors[sector_search_ds0][(1 - sector_search_hds) * 8+:8] > 29 ? 2'd2 : 2'd1), 8'd0};
+						sector_offset[sector_search_ds0][sector_search_hds] <= {image_track_offsets_in + (i_current_track_sectors[{sector_search_ds0, sector_search_hds}] > 29 ? 2'd2 : 2'd1), 8'd0};
 						tinfo_addr <= {image_track_offsets_in[0], 8'h14};
 						tinfo_hds <= sector_search_hds;
 						tinfo_ds0 <= sector_search_ds0;
@@ -631,7 +632,7 @@ module u765 (
 						sector_end_pos[sector_search_ds0][sector_search_hds] <= (SECTOR_SIZE(sector_n[sector_search_ds0][sector_search_hds], sector_length[sector_search_ds0][sector_search_hds]) + SECTOR_EXTRA_DATA_LEN) - 1;
 						sector_search_state <= 0;
 					end
-					else if (i_current_sector == (i_current_track_sectors[sector_search_ds0][(1 - sector_search_hds) * 8+:8] - 1)) begin
+					else if (i_current_sector == (i_current_track_sectors[{sector_search_ds0, sector_search_hds}] - 1)) begin
 						$display("sector no. %d not found!", i_next_sector_pos[sector_search_ds0][sector_search_hds]);
 						i_secinfo_valid[((1 - sector_search_ds0) * 2) + (1 - sector_search_hds)] <= 1;
 						i_current_sector_pos[sector_search_ds0][(1 - sector_search_hds) * 8+:8] <= i_next_sector_pos[sector_search_ds0][sector_search_hds];
@@ -654,7 +655,7 @@ module u765 (
 						if (i_secinfo_valid[((1 - i_current_drive) * 2) + (1 - i)] & i_byte_clk_en) begin
 							sector_byte_pos[i_current_drive][(1 - i) * 17+:17] <= sector_byte_pos[i_current_drive][(1 - i) * 17+:17] + 1'd1;
 							if (sector_byte_pos[i_current_drive][(1 - i) * 17+:17] >= (sector_end_pos[i_current_drive][i] + gap3[i_current_drive][i])) begin
-								if ((i_current_sector_pos[i_current_drive][(1 - i) * 8+:8] == (i_current_track_sectors[i_current_drive][(1 - i) * 8+:8] - 1'd1)) || (i_current_track_sectors[i_current_drive][(1 - i) * 8+:8] == 0)) begin
+								if ((i_current_sector_pos[i_current_drive][(1 - i) * 8+:8] == (i_current_track_sectors[{i_current_drive, i[0]}] - 1'd1)) || (i_current_track_sectors[{i_current_drive, i[0]}] == 0)) begin
 									if (i_rpm_timer[i_current_drive][i] >= TRACK_TIME) begin
 										i_next_sector_pos[i_current_drive][i] <= 0;
 										sector_byte_pos[i_current_drive][(1 - i) * 17+:17] <= 0;
@@ -807,7 +808,7 @@ module u765 (
 							m_status[UPD765_MAIN_EXM] <= 1;
 							m_status[UPD765_MAIN_DIO] <= 1;
 						end
-						if (i_current_track_sectors[ds0][(1 - hds) * 8+:8] == 0) begin
+						if (i_current_track_sectors[{ds0, hds}] == 0) begin
 							i_sector_c <= pcn[(1 - ds0) * 8+:8];
 							i_sector_h <= {7'd0, hds};
 							i_sector_r <= 8'h00;
@@ -874,7 +875,7 @@ module u765 (
 						m_status[UPD765_MAIN_DIO] <= ~i_write;
 						if (i_rtrack)
 							i_r <= 0;
-						if (i_current_track_sectors[ds0][(1 - hds) * 8+:8] == 0) begin
+						if (i_current_track_sectors[{ds0, hds}] == 0) begin
 							i_sector_c <= i_c;
 							i_sector_h <= i_h;
 							i_sector_r <= i_r;
@@ -900,7 +901,7 @@ module u765 (
 						i_sector <= i_current_sector_pos[ds0][(1 - hds) * 8+:8];
 						if (i_sector != i_current_sector_pos[ds0][(1 - hds) * 8+:8])
 							$display("checking sector %d - C: %d H: %d R: %d N: %d ST1: %d ST2: %d length: %d", i_current_sector_pos[ds0][(1 - hds) * 8+:8], sector_c[ds0][hds], sector_h[ds0][hds], sector_r[ds0][hds], sector_n[ds0][hds], sector_st1[ds0][hds], sector_st2[ds0][hds], sector_length[ds0][hds]);
-						if (((i_current_sector_pos[ds0][(1 - hds) * 8+:8] == (i_current_track_sectors[ds0][(1 - hds) * 8+:8] - 1)) && (sector_byte_pos[ds0][(1 - hds) * 17+:17] == ((sector_end_pos[ds0][hds] + gap3[ds0][hds]) - 1))) && (ds0 == i_current_drive)) begin
+						if (((i_current_sector_pos[ds0][(1 - hds) * 8+:8] == (i_current_track_sectors[{ds0, hds}] - 1)) && (sector_byte_pos[ds0][(1 - hds) * 17+:17] == ((sector_end_pos[ds0][hds] + gap3[ds0][hds]) - 1))) && (ds0 == i_current_drive)) begin
 							$display("passed index mark, pass: %d", i_scanning);
 							if (i_scanning) begin
 								status[0] <= (i_rtrack ? 8'h00 : 8'h40);
