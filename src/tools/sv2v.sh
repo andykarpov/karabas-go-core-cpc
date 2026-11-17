@@ -32,7 +32,7 @@ core)
 	OUT=rtl/sv2v
 	rm -rf $OUT && mkdir $OUT
 	$SV2V -DKG_CLASSIC -I ../upstream --top=cpc_core rtl/karabas/cpc_emu.sv rtl/karabas/cpc_mister_stubs.sv \
-		rtl/karabas/cpc_core.v rtl/karabas/cpc_sram.v ../modules/rtl/mem/kg_fifo.v \
+		rtl/karabas/cpc_core.v rtl/karabas/cpc_sram.v rtl/karabas/cpc_sd_sdc.v ../modules/rtl/mem/kg_fifo.v \
 		$RTL -w $OUT 2>&1 | grep -v -E '^\s*$|Warning: Number literal|^ *[0-9]* \||^\s*\|' || true
 	rm -f $OUT/kg_fifo.v   # the boards take it from modules/
 	{ for f in $VHDL; do echo "vhdl work \"$f\""; done

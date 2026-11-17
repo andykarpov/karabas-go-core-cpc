@@ -5,6 +5,8 @@ module cpc_core (
 	areset,
 	ld_kind,
 	ld_slot,
+	ld_ext,
+	ld_start,
 	ld_active,
 	ld_wr,
 	ld_addr,
@@ -23,6 +25,19 @@ module cpc_core (
 	sw_crtc,
 	sw_display,
 	sw_reset,
+	sdc_img_mounted,
+	sdc_img_size,
+	img_wp,
+	sdc_rd,
+	sdc_wr,
+	sdc_sector,
+	sdc_busy,
+	sdc_done,
+	sdc_slot,
+	sdc_byte_in_strobe,
+	sdc_byte_addr,
+	sdc_byte_in_data,
+	sdc_byte_out_data,
 	MA,
 	MD_I,
 	MD_O,
@@ -49,6 +64,8 @@ module cpc_core (
 	input wire areset;
 	input wire [1:0] ld_kind;
 	input wire [7:0] ld_slot;
+	input wire [63:0] ld_ext;
+	input wire ld_start;
 	input wire ld_active;
 	input wire ld_wr;
 	input wire [31:0] ld_addr;
@@ -67,6 +84,19 @@ module cpc_core (
 	input wire sw_crtc;
 	input wire [2:0] sw_display;
 	input wire sw_reset;
+	input wire [7:0] sdc_img_mounted;
+	input wire [63:0] sdc_img_size;
+	input wire [7:0] img_wp;
+	output wire [7:0] sdc_rd;
+	output wire [7:0] sdc_wr;
+	output wire [31:0] sdc_sector;
+	input wire sdc_busy;
+	input wire sdc_done;
+	input wire [2:0] sdc_slot;
+	input wire sdc_byte_in_strobe;
+	input wire [8:0] sdc_byte_addr;
+	input wire [7:0] sdc_byte_in_data;
+	output wire [7:0] sdc_byte_out_data;
 	output wire [20:0] MA;
 	input wire [15:0] MD_I;
 	output wire [15:0] MD_O;
@@ -87,19 +117,54 @@ module cpc_core (
 	output wire tape_out;
 	output wire led_user;
 	output wire loading;
+	function [8:0] ld_index;
+		input [1:0] kind;
+		input [7:0] slot;
+		begin
+			ld_index = 9'd0;
+			if (kind == 2'd0)
+				ld_index = 9'h100;
+			else if (kind == 2'd2)
+				case (slot)
+					8'd2: ld_index = 9'h104;
+					8'd3: ld_index = 9'h106;
+					8'd4: ld_index = 9'h103;
+					default:
+						;
+				endcase
+		end
+	endfunction
+	function [31:0] mister_ext;
+		input [63:0] e;
+		integer k;
+		reg [7:0] c;
+		begin
+			mister_ext = 32'd0;
+			for (k = 0; k < 8; k = k + 1)
+				begin
+					c = e[k * 8+:8];
+					if (c != 8'd0)
+						mister_ext = {mister_ext[23:0], ((c >= "a") && (c <= "z") ? c - 8'd32 : c)};
+				end
+		end
+	endfunction
 	wire ioctl_wait;
 	wire fifo_full;
 	wire fifo_empty;
 	wire [10:0] fifo_count;
 	wire [32:0] fifo_dout;
 	reg fifo_rd = 1'b0;
+	wire [8:0] ld_ix = ld_index(ld_kind, ld_slot);
+	reg ld_take = 1'b0;
+	reg ld_first = 1'b0;
+	reg [7:0] ld_idx = 8'd0;
 	kg_fifo #(
 		.DW(33),
 		.AW(10)
 	) ld_fifo(
 		.clk(clk_sys),
 		.reset(areset),
-		.wr(ld_wr && (ld_kind == 2'd0)),
+		.wr(ld_wr && ld_take),
 		.din({ld_addr[24:0], ld_data}),
 		.full(fifo_full),
 		.rd(fifo_rd),
@@ -108,8 +173,9 @@ module cpc_core (
 		.count(fifo_count)
 	);
 	assign ld_ready = fifo_count <= 11'd512;
-	reg ld_on = 1'b0;
 	reg ioctl_download = 1'b0;
+	reg [7:0] ioctl_index = 8'd0;
+	reg [31:0] ioctl_file_ext = 32'd0;
 	reg ioctl_wr = 1'b0;
 	reg [24:0] ioctl_addr = 25'd0;
 	reg [7:0] ioctl_dout = 8'd0;
@@ -121,25 +187,33 @@ module cpc_core (
 		if (pace != 4'd0)
 			pace <= pace - 4'd1;
 		if (areset) begin
-			ld_on <= 1'b0;
+			ld_take <= 1'b0;
+			ld_first <= 1'b0;
 			ioctl_download <= 1'b0;
 			rd_ph <= 2'd0;
 			pace <= 4'd0;
 		end
 		else begin
-			if (ld_active && (ld_kind == 2'd0)) begin
-				ld_on <= 1'b1;
+			if (ld_start) begin
+				ld_take <= ld_ix[8];
+				ld_idx <= ld_ix[7:0];
+				ld_first <= 1'b1;
+			end
+			else if (!ld_active)
+				ld_take <= 1'b0;
+			if ((ld_wr && ld_take) && ld_first) begin
+				ld_first <= 1'b0;
+				ioctl_index <= ld_idx;
+				ioctl_file_ext <= mister_ext(ld_ext);
 				ioctl_download <= 1'b1;
 			end
-			else
-				ld_on <= 1'b0;
 			case (rd_ph)
 				2'd0:
-					if ((!fifo_empty && (pace == 4'd0)) && !ioctl_wait) begin
+					if (((!fifo_empty && (pace == 4'd0)) && !ioctl_wait) && ioctl_download) begin
 						fifo_rd <= 1'b1;
 						rd_ph <= 2'd1;
 					end
-					else if ((fifo_empty && !ld_on) && !(ld_active && (ld_kind == 2'd0)))
+					else if (fifo_empty && !ld_take)
 						ioctl_download <= 1'b0;
 				2'd1: rd_ph <= 2'd2;
 				default: begin
@@ -204,7 +278,42 @@ module cpc_core (
 	wire [31:0] sd_lba;
 	wire [1:0] sd_rd;
 	wire [1:0] sd_wr;
+	wire [1:0] sd_ack;
+	wire [1:0] img_mounted;
 	wire [7:0] sd_buff_din;
+	wire [7:0] sd_buff_dout;
+	wire [8:0] sd_buff_addr;
+	wire sd_buff_wr;
+	wire img_readonly;
+	wire [63:0] img_size;
+	cpc_sd_sdc disks(
+		.clk(clk_sys),
+		.reset(areset),
+		.sd_lba(sd_lba),
+		.sd_rd(sd_rd),
+		.sd_wr(sd_wr),
+		.sd_ack(sd_ack),
+		.sd_buff_addr(sd_buff_addr),
+		.sd_buff_dout(sd_buff_dout),
+		.sd_buff_din(sd_buff_din),
+		.sd_buff_wr(sd_buff_wr),
+		.img_mounted(img_mounted),
+		.img_size(img_size),
+		.img_readonly(img_readonly),
+		.sdc_img_mounted(sdc_img_mounted),
+		.sdc_img_size(sdc_img_size),
+		.img_wp(img_wp),
+		.sdc_rd(sdc_rd),
+		.sdc_wr(sdc_wr),
+		.sdc_sector(sdc_sector),
+		.sdc_busy(sdc_busy),
+		.sdc_done(sdc_done),
+		.sdc_slot(sdc_slot),
+		.sdc_byte_in_strobe(sdc_byte_in_strobe),
+		.sdc_byte_addr(sdc_byte_addr),
+		.sdc_byte_in_data(sdc_byte_in_data),
+		.sdc_byte_out_data(sdc_byte_out_data)
+	);
 	cpc_emu emu(
 		.clk_sys(clk_sys),
 		.locked(locked),
@@ -216,23 +325,23 @@ module cpc_core (
 		.joy1_usb(joy1_usb),
 		.joy2_usb(joy2_usb),
 		.ioctl_download(ioctl_download),
-		.ioctl_index(8'd0),
+		.ioctl_index(ioctl_index),
 		.ioctl_wr(ioctl_wr),
 		.ioctl_addr(ioctl_addr),
 		.ioctl_dout(ioctl_dout),
-		.ioctl_file_ext(32'd0),
+		.ioctl_file_ext(ioctl_file_ext),
 		.ioctl_wait(ioctl_wait),
-		.img_mounted(2'b00),
-		.img_size(64'd0),
-		.img_readonly(1'b0),
+		.img_mounted(img_mounted),
+		.img_size(img_size),
+		.img_readonly(img_readonly),
 		.sd_lba(sd_lba),
 		.sd_rd(sd_rd),
 		.sd_wr(sd_wr),
-		.sd_ack(2'b00),
-		.sd_buff_addr(9'd0),
-		.sd_buff_dout(8'd0),
+		.sd_ack(sd_ack),
+		.sd_buff_addr(sd_buff_addr),
+		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(sd_buff_din),
-		.sd_buff_wr(1'b0),
+		.sd_buff_wr(sd_buff_wr),
 		.MA(MA),
 		.MD_I(MD_I),
 		.MD_O(MD_O),

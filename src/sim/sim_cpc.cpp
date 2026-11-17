@@ -74,6 +74,9 @@ int main(int argc, char **argv) {
 	bool load_done = false;
 	tb->ld_kind = 0;
 	tb->ld_active = 1;
+	tb->ld_start = 1;
+	tick();
+	tb->ld_start = 0;
 
 	// PS/2 bytes to send, one per 2000 clocks (the mcu sends a key as one packet)
 	std::deque<std::pair<uint64_t, uint8_t>> ps2;

@@ -252,11 +252,31 @@ TIMESPEC "TS_SRAM_IN" = FROM "TG_SRAM_IN" TO FFS 4 ns DATAPATHONLY;
 # clk_sys periods. The keys and pads (kg_l2_hid, the key matrix of hid.sv) are user input, a clock
 # later is the same: two periods too. Worst paths of 26111701 were T80 internal, joy_r / key -> the
 # T80 decoder, at 0.35 ns slack.
-INST "core/emu/motherboard/CPU/u0/*" TNM = "TG_T80";
+# (the whole CPU: T80pa also changes RD_n / WR_n / IORQ_n / MREQ_n / DI_Reg only on CEN_p / CEN_n, every
+# 8 clk_sys; build 26111705 failed on CPU/RD_n -> crtc)
+INST "core/emu/motherboard/CPU/*" TNM = "TG_T80";
 INST "mcu/u_hid/*" TNM = "TG_KEYS";
 INST "core/emu/motherboard/HID/*" TNM = "TG_KEYS";
 TIMESPEC "TS_T80_MC" = FROM "TG_T80" TO "TG_CLK_SYS" 31.25 ns;
 TIMESPEC "TS_KEYS_MC" = FROM "TG_KEYS" TO "TG_CLK_SYS" 31.25 ns;
+# The counters of the CRTC (hcc, row, row_addr / row_addr_r) change only on its character clock enable
+# CLKEN (1 MHz, every 64 clk_sys; all enables of the GA are on the ce_16 grid, 4 clk_sys apart): paths
+# from them get two periods (26111705: crtc/row -> VSYNC_r / row_addr_r failed by 0.6 ns at 87 % slices).
+INST "core/emu/motherboard/crtc/row_*" TNM = "TG_CRTC_CNT";
+INST "core/emu/motherboard/crtc/hcc_*" TNM = "TG_CRTC_CNT";
+TIMESPEC "TS_CRTC_MC" = FROM "TG_CRTC_CNT" TO "TG_CLK_SYS" 31.25 ns;
+# (no multicycle into u765: "-to u765|i_*" of MiSTer relaxes paths whose sources (the sector buffer the
+# mounter writes, the CPU bus) change at any clock, not only on the clock enable of u765; it is unsafe,
+# so left out. The disk reads that hung on the board then (26111707..26111713) were not timing: XST made
+# tristates of the [i_current_drive] array writes of u765, fixed in its source in 26111714.)
+# Instead FROM the registers of u765 that change only on its clock enable (8 MHz; hds / ds0 and the
+# fdc.i_* of the fdc block, assigned in its "if (ce)" parts; the exceptions i_secinfo_valid, i_seek_start /
+# i_current_sector_pos are also cleared on a mount, once, and held for long after): two periods
+# (26111711 without it: hds -> fdc.i_sector_size / state by 0.6 ns at 98 % slices).
+INST "core/emu/u765/hds*" TNM = "TG_U765_CE";
+INST "core/emu/u765/ds0*" TNM = "TG_U765_CE";
+INST "core/emu/u765/fdc.i_*" TNM = "TG_U765_CE";
+TIMESPEC "TS_U765_CE_MC" = FROM "TG_U765_CE" TO "TG_CLK_SYS" 31.25 ns;
 # zhdmi takes its words from clk_pix registers into the x5 clock (the serialiser of hdmi_tx)
 TIMESPEC "TS_PIX_TO_HDMI" = FROM "TG_CLK_PIX" TO "TG_CLK_HDMI" TIG;
 # the reset (kg_sync in clk_sys and clk_pix): the locked flag of the PLL is asynchronous to them
