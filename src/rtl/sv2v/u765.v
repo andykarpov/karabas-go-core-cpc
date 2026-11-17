@@ -241,6 +241,11 @@ module u765 (
 			SECTOR_SIZE = (logical_size < stored_size ? logical_size : stored_size);
 		end
 	endfunction
+	reg [1:0] image_scan_state [0:1];
+	initial begin
+		image_scan_state[0] = 2'd0;
+		image_scan_state[1] = 2'd0;
+	end
 	always @(posedge clk_sys) begin : fdc
 		reg [31:0] image_size [0:1];
 		reg image_ready [0:1];
@@ -249,7 +254,6 @@ module u765 (
 		reg [1:0] image_wp;
 		reg [0:1] image_trackinfo_dirty;
 		reg image_edsk [0:1];
-		reg [1:0] image_scan_state [0:1];
 		reg [19:0] i_steptimer [0:1];
 		reg [19:0] i_rpm_timer [0:1][0:1];
 		reg [3:0] i_step_state [0:1];
