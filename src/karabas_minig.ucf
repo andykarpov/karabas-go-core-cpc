@@ -265,11 +265,16 @@ TIMESPEC "TS_KEYS_MC" = FROM "TG_KEYS" TO "TG_CLK_SYS" 31.25 ns;
 INST "core/emu/motherboard/crtc/row_*" TNM = "TG_CRTC_CNT";
 INST "core/emu/motherboard/crtc/hcc_*" TNM = "TG_CRTC_CNT";
 TIMESPEC "TS_CRTC_MC" = FROM "TG_CRTC_CNT" TO "TG_CLK_SYS" 31.25 ns;
-# u765 (as the Amstrad.sdc of MiSTer: "-to u765|i_* -setup 2"): its registers named i_* change only on
-# its clock enable (8 MHz) ("prefix internal CE protected registers with i_, so it's easier to write
-# constraints"), so the paths into them get two clk_sys periods.
-INST "core/emu/u765/*i_*" TNM = "TG_U765_I";
-TIMESPEC "TS_U765_MC" = FROM "TG_CLK_SYS" TO "TG_U765_I" 31.25 ns;
+# (no multicycle into u765: "-to u765|i_*" of MiSTer relaxes paths whose sources (the sector buffer the
+# mounter writes, the CPU bus) change at any clock, not only on the clock enable of u765; with it the
+# disk reads of 26111707 found no sector)
+# Instead FROM the registers of u765 that change only on its clock enable (8 MHz; hds / ds0 and the
+# fdc.i_* of the fdc block, assigned only in its "else if (ce)" branch): two periods (26111711 without
+# it: hds -> fdc.i_sector_size / state by 0.6 ns at 98 % slices).
+INST "core/emu/u765/hds*" TNM = "TG_U765_CE";
+INST "core/emu/u765/ds0*" TNM = "TG_U765_CE";
+INST "core/emu/u765/fdc.i_*" TNM = "TG_U765_CE";
+TIMESPEC "TS_U765_CE_MC" = FROM "TG_U765_CE" TO "TG_CLK_SYS" 31.25 ns;
 # zhdmi takes its words from clk_pix registers into the x5 clock (the serialiser of hdmi_tx)
 TIMESPEC "TS_PIX_TO_HDMI" = FROM "TG_CLK_PIX" TO "TG_CLK_HDMI" TIG;
 # the reset (kg_sync in clk_sys and clk_pix): the locked flag of the PLL is asynchronous to them
