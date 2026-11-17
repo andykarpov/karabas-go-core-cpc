@@ -349,6 +349,15 @@ function [15:0] SECTOR_SIZE;
 	end
 endfunction
 
+// karabas: out of the always block with an initial value 0. Without one XST took this self-holding
+// register (it changes only on img_mounted) as a constant 1 ("scanning an image"), RQM then never
+// let a command start and AMSDOS hung at boot (build 26111702, no disks wired yet).
+reg [1:0] image_scan_state[2];
+initial begin
+	image_scan_state[0] = 2'd0;
+	image_scan_state[1] = 2'd0;
+end
+
 always @(posedge clk_sys) begin : fdc
 
    //prefix internal CE protected registers with i_, so it's easier to write constraints
@@ -361,7 +370,7 @@ always @(posedge clk_sys) begin : fdc
 	reg [1:0] image_wp;
 	reg       image_trackinfo_dirty[2];
 	reg       image_edsk[2]; //DSK - 0, EDSK - 1
-	reg [1:0] image_scan_state[2];
+	// karabas: image_scan_state moved to module scope with an initial value (below the always)
 	reg[19:0] i_steptimer[2], i_rpm_timer[2][2];
 	reg [3:0] i_step_state[2]; //counting cycles for steptimer
 	reg [7:0] i_byte_clk_cnt;

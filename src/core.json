@@ -1,0 +1,71 @@
+{
+    "id": "cpc",
+    "name": "Amstrad CPC",
+    "build": "26111704",
+    "visible": true,
+    "type": "osd",
+    "order": 26,
+    "eeprom_bank": 255,
+    "rtc_mode": 0,
+    "roms": [
+        {
+            "filename": "roms/boot.rom",
+            "address": 0
+        }
+    ],
+    "boards": {
+        "minig": {
+            "link": 2,
+            "build": "26111704",
+            "bitstream": "karabas_minig.bin"
+        }
+    },
+    "osd": [
+        {
+            "type": "S",
+            "name": "Model",
+            "options": [
+                "CPC 6128",
+                "CPC 664",
+                "CPC 464"
+            ],
+            "default": 0,
+            "hotkey": "Menu+M",
+            "index": 0
+        },
+        {
+            "type": "S",
+            "name": "CRTC",
+            "options": [
+                "Type 1",
+                "Type 0"
+            ],
+            "default": 0,
+            "index": 1
+        },
+        {
+            "type": "S",
+            "name": "Display",
+            "options": [
+                "Colour GA",
+                "Colour ASIC",
+                "Green",
+                "Amber",
+                "Cyan",
+                "White"
+            ],
+            "default": 0,
+            "hotkey": "Menu+D",
+            "index": 2
+        },
+        {
+            "type": "-"
+        },
+        {
+            "type": "T",
+            "name": "Reset",
+            "hotkey": "F12",
+            "index": 3
+        }
+    ]
+}

@@ -891,6 +891,15 @@ asic_dma dma_sound
 	.psg_active(psg_dma_active)
 );
 
+`ifdef KG_CLASSIC
+// karabas: the classic-only build has no sprite engine (16 sprites in parallel: 7939 LUT and over 10
+// minutes of XST alone). In classic mode its outputs stay inactive (the sprite registers are written
+// only in Plus mode), so they are constants here.
+assign plus_spr_en = 1'b0;
+assign plus_spr_rgb = 12'd0;
+assign plus_spr_fq_req = 1'b0;
+assign plus_spr_fq_addr = 11'd0;
+`else
 // P4 hardware sprite engine: compares against the CRTC3 taps ([KT]
 // formulas), stages row bytes through asic_page's video port, and
 // composites between screen and border inside asic_video.
@@ -930,6 +939,7 @@ asic_sprites #(
 	.SPR_IDX(),
 	.SPR_WIN()
 );
+`endif
 
 // The caller uses plus_asic_rd to mux the CPU data bus and to suppress
 // main-memory read AND write cycles for the whole &4000-&7FFF window
