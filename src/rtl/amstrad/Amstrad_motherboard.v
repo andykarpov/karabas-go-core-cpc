@@ -344,7 +344,7 @@ assign snap_printer_data = printer_data;
 	.cen_n(phi_en_n & ~sna_hold & ~save_hold),
 
 	.a(A),
-	.do(D),
+	.dout(D), // karabas: T80pa port DO -> DOUT (do is an SV keyword)
 	.di(cpu_data_bus),
 
 	.rd_n(RD_n),

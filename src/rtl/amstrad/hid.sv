@@ -53,9 +53,9 @@ wire [6:0] joy2 = row6 ? {joystick2[6:4], joystick2[0], joystick2[1], joystick2[
 reg [7:0] key[16] = '{default:0};
 
 wire press = ps2_key[9];
+reg alt = 0; // karabas: out of the always block (sv2v re-inits a local initialised reg every clock)
 always @(posedge clk) begin
 	reg old_flg, old_reset;
-	reg alt = 0;
 
 	old_flg <= ps2_key[10];
 	old_reset <= reset;
