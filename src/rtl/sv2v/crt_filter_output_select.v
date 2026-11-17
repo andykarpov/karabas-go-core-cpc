@@ -1,0 +1,34 @@
+`default_nettype wire
+module crt_filter_output_select (
+	MODE,
+	HSYNC_FILTERED,
+	VSYNC_FILTERED,
+	HBLANK_FILTERED,
+	VBLANK_FILTERED,
+	HSYNC_RAW,
+	VSYNC_RAW,
+	HBLANK_RAW,
+	VBLANK_RAW,
+	HSYNC_OUT,
+	VSYNC_OUT,
+	HBLANK_OUT,
+	VBLANK_OUT
+);
+	input [1:0] MODE;
+	input HSYNC_FILTERED;
+	input VSYNC_FILTERED;
+	input HBLANK_FILTERED;
+	input VBLANK_FILTERED;
+	input HSYNC_RAW;
+	input VSYNC_RAW;
+	input HBLANK_RAW;
+	input VBLANK_RAW;
+	output wire HSYNC_OUT;
+	output wire VSYNC_OUT;
+	output wire HBLANK_OUT;
+	output wire VBLANK_OUT;
+	assign HSYNC_OUT = (MODE != 2'd2 ? HSYNC_FILTERED : HSYNC_RAW);
+	assign VSYNC_OUT = (MODE != 2'd2 ? VSYNC_FILTERED : VSYNC_RAW);
+	assign HBLANK_OUT = (MODE != 2'd2 ? HBLANK_FILTERED : HBLANK_RAW);
+	assign VBLANK_OUT = (MODE != 2'd2 ? VBLANK_FILTERED : VBLANK_RAW);
+endmodule

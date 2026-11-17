@@ -86,3 +86,6 @@ src/xsth/
 src/measure/xst_classic.log
 !src/measure/cpc_measure_classic.prj
 !src/measure/cpc_measure_classic.xst
+!src/cpc.prj
+src/build_*.log
+src/sim/build/
