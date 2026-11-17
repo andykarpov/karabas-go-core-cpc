@@ -816,32 +816,10 @@ module Amstrad_motherboard (
 		.psg_dout(psg_dma_dout),
 		.psg_active(psg_dma_active)
 	);
-	asic_sprites #(.H_ORIGIN_DOTS(10'd16)) plus_sprites(
-		.CLOCK(clk),
-		.PIXEN(ce_16),
-		.CLKEN(plus_cclk_en_n),
-		.HWRAP(plus_hwrap),
-		.nRESET(~reset),
-		.LINE(plus_vc),
-		.ROW(plus_rc),
-		.SPR_X(plus_spr_x),
-		.SPR_Y(plus_spr_y),
-		.SPR_MAG(plus_spr_mag),
-		.SPR_PAL(plus_spr_pal),
-		.ACC_EN(plus_spr_acc_en),
-		.ACC_IDX(plus_spr_acc_idx),
-		.spr_wr_en(plus_spr_wr_en),
-		.spr_wr_addr(plus_spr_wr_addr),
-		.spr_wr_data(plus_spr_wr_data),
-		.FQ_REQ(plus_spr_fq_req),
-		.FQ_ADDR(plus_spr_fq_addr),
-		.FQ_DATA(plus_spr_fq_data),
-		.FQ_ACK(plus_spr_fq_ack),
-		.SPR_EN(plus_spr_en),
-		.SPR_RGB(plus_spr_rgb),
-		.SPR_IDX(),
-		.SPR_WIN()
-	);
+	assign plus_spr_en = 1'b0;
+	assign plus_spr_rgb = 12'd0;
+	assign plus_spr_fq_req = 1'b0;
+	assign plus_spr_fq_addr = 11'd0;
 	reg [7:0] vram_d;
 	always @(posedge clk)
 		if (reset)

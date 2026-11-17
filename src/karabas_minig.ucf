@@ -247,6 +247,16 @@ TIMEGRP "TG_SRAM_IN" = PADS("MD<*>");
 TIMEGRP "TG_SRAM_OUT" = "TG_SRAM_IN" PADS("MA<*>") PADS("MWR_N<*>") PADS("MRD_N<*>");
 TIMESPEC "TS_SRAM_OUT" = FROM FFS TO "TG_SRAM_OUT" 8 ns DATAPATHONLY;
 TIMESPEC "TS_SRAM_IN" = FROM "TG_SRAM_IN" TO FFS 4 ns DATAPATHONLY;
+# Multicycle (as the Amstrad.sdc of MiST, gyurco: "from T80 -setup 2"): the T80 changes its registers
+# only on its clock enables (4 MHz, never two clk_sys edges in a row), so the paths from them get two
+# clk_sys periods. The keys and pads (kg_l2_hid, the key matrix of hid.sv) are user input, a clock
+# later is the same: two periods too. Worst paths of 26111701 were T80 internal, joy_r / key -> the
+# T80 decoder, at 0.35 ns slack.
+INST "core/emu/motherboard/CPU/u0/*" TNM = "TG_T80";
+INST "mcu/u_hid/*" TNM = "TG_KEYS";
+INST "core/emu/motherboard/HID/*" TNM = "TG_KEYS";
+TIMESPEC "TS_T80_MC" = FROM "TG_T80" TO "TG_CLK_SYS" 31.25 ns;
+TIMESPEC "TS_KEYS_MC" = FROM "TG_KEYS" TO "TG_CLK_SYS" 31.25 ns;
 # zhdmi takes its words from clk_pix registers into the x5 clock (the serialiser of hdmi_tx)
 TIMESPEC "TS_PIX_TO_HDMI" = FROM "TG_CLK_PIX" TO "TG_CLK_HDMI" TIG;
 # the reset (kg_sync in clk_sys and clk_pix): the locked flag of the PLL is asynchronous to them
