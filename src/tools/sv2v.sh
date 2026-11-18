@@ -38,10 +38,10 @@ core)
 	{ for f in $VHDL; do echo "vhdl work \"$f\""; done
 	  for f in $OUT/*.v; do echo "verilog work \"$f\""; done; } > cpc.prj
 	# the boards: the modules of karabas-go-modules (tools/board_modules.prj), the core, the clocks, the top
-	for b in minig; do   # Go and Mini: Ф3 (tools/mktops.py)
+	for b in minig mini go; do   # the Mini / Go tops: tools/mktops.py
 		{ cat tools/board_modules.prj; cat cpc.prj
 		  echo 'verilog work "rtl/karabas/cpc_clocks.v"'
-	  echo 'verilog work "rtl/karabas/cpc_video_out.v"'
+		  echo 'verilog work "rtl/karabas/cpc_video_out.v"'
 		  echo "verilog work \"rtl/karabas_${b}_top.v\""; } > karabas_$b.prj
 	done
 	ls $OUT | wc -l ;;

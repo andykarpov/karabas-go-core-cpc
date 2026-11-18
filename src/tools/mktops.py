@@ -4,7 +4,7 @@ part of karabas_mini.ucf / karabas_go.ucf from that of karabas_minig.ucf (as cor
 
 The three tops share everything but the board: change the Mini G top, then run this (every
 replacement must match once, else it stops). The pin parts of the Mini / Go ucf (above the timing
-mark) are kept; the ports are those of core-macplus / core-atarist.
+mark) are kept; the ports are those of core-atari2600 (its pin parts were copied for Ф3).
 
 Mini (before rev.G): MCU_SCK not on a clock pin (no BUFG), 4 MCU_IO,
   sigma-delta audio on AUDIO_L / AUDIO_R instead of the PCM5102, FT_RESET, the ESP pins.
@@ -189,8 +189,10 @@ GO_PORTS = "module karabas_go_top (\n" + COMMON_PORTS_HEAD + """
 
 """ + FLASH_PORTS
 
-HEADER_G = (" Atari 2600 VCS core for Karabas Mini rev.G (HDMI, PCM5102): atari2600_top (the 2600 part of k7800\n"
-            " through sv2v, rtl/karabas) with the karabas parts and the board glue of karabas-go-modules.\n")
+HEADER_G = (" Amstrad CPC core for Karabas Mini rev.G (HDMI, PCM5102): cpc_core (the CPC of the renaudguerin\n"
+            " Amstrad_MiSTer fork, classic models, rtl/karabas) with the board glue of karabas-go-modules.\n")
+CORE_LINE = (" cpc_core (the CPC of the renaudguerin Amstrad_MiSTer fork, classic models, rtl/karabas) with the\n"
+             " board glue of karabas-go-modules.\n")
 
 MCU_SCK_G = """wire mcu_sck_ibufg, mcu_sck;
 IBUFG ibufg_mcu_sck (.I(MCU_SCK), .O(mcu_sck_ibufg));
@@ -206,11 +208,11 @@ assign MIDI_CLK = 1'b0;      // the SAM2695 synth: held in reset, not used
 assign MIDI_RESET_N = 1'b0;
 """
 
-PCM = """kg_pcm5102 #(.DIV_BITS(2)) dac (  // bck 4.06 MHz, 127 kHz
+PCM = """kg_pcm5102 #(.DIV_BITS(3)) dac (  // bck 4 MHz, 125 kHz
 	.clk(clk_sys),
 	.reset(areset),
-	.left(audio_l),
-	.right(audio_r),
+	.left(snd_l),
+	.right(snd_r),
 	.din(DAC_DAT),
 	.bck(DAC_BCK),
 	.lrck(DAC_WS)
@@ -227,31 +229,29 @@ def common(s):
 
 def mini(s):
     s = sub(s, HEADER_G,
-            " Atari 2600 VCS core for Karabas Mini before rev.G (HDMI, sigma-delta audio). Made by\n"
+            " Amstrad CPC core for Karabas Mini before rev.G (HDMI, sigma-delta audio). Made by\n"
             " tools/mktops.py from karabas_minig_top.v (do not edit: change that one and run it): the same\n"
             " except the pins, the MCU link (MCU_SCK not on a clock pin) and the audio (AUDIO_L / AUDIO_R).\n"
-            " atari2600_top (the 2600 part of k7800 through sv2v, rtl/karabas) with the karabas parts and the\n"
-            " board glue of karabas-go-modules.\n", "header")
+            + CORE_LINE, "header")
     s = ports(s, MINI_PORTS)
     s = common(s)
     s = sub(s, "assign MIDI_RESET_N = 1'b0;\n", "assign MIDI_RESET_N = 1'b0;\nassign FT_RESET = 1'b1;\n", "FT_RESET")
     s = sub(s, "assign MCU_IO[5:2] = 4'bzzzz;\n", "assign MCU_IO[3:2] = 2'bzz;\n", "MCU_IO")
-    s = sub(s, PCM, "// no I2S DAC on this board: sigma-delta outputs into an RC filter (offset binary: the mix\n"
+    s = sub(s, PCM, "// no I2S DAC on this board: sigma-delta outputs into an RC filter (offset binary: snd_l / snd_r\n"
                "// 0 .. 7FFF as the full range)\n"
-               "kg_sigma_delta_dac dac_l (.clk(clk_sys), .reset(areset), .din({ audio_l[14:0], 1'b0 }), .dout(AUDIO_L));\n"
-               "kg_sigma_delta_dac dac_r (.clk(clk_sys), .reset(areset), .din({ audio_r[14:0], 1'b0 }), .dout(AUDIO_R));\n",
+               "kg_sigma_delta_dac dac_l (.clk(clk_sys), .reset(areset), .din({ snd_l[14:0], 1'b0 }), .dout(AUDIO_L));\n"
+               "kg_sigma_delta_dac dac_r (.clk(clk_sys), .reset(areset), .din({ snd_r[14:0], 1'b0 }), .dout(AUDIO_R));\n",
             "audio")
     return s
 
 
 def go(s):
     s = sub(s, HEADER_G,
-            " Atari 2600 VCS core for Karabas Go (VGA, PCM5102). Made by tools/mktops.py from\n"
+            " Amstrad CPC core for Karabas Go (VGA, PCM5102). Made by tools/mktops.py from\n"
             " karabas_minig_top.v (do not edit: change that one and run it): the same except the pins, the MCU\n"
             " link (MCU_SCK not on a clock pin) and the video: 24 bit RGB to the VGA DAC with its pixel clock on\n"
             " V_CLK (clk_pix), the FT812 off that bus (FT_OE_N = 1), no HDMI. The floppy connector is not used\n"
-            " (its outputs 0). atari2600_top (the 2600 part of k7800 through sv2v, rtl/karabas) with the\n"
-            " karabas parts and the board glue of karabas-go-modules.\n", "header")
+            " (its outputs 0).\n" + CORE_LINE, "header")
     s = ports(s, GO_PORTS)
     s = common(s)
     s = sub(s, "assign ADC_CLK = 1'b0;\nassign ADC_BCK = 1'bz;\nassign ADC_LRCK = 1'bz;\n",
@@ -278,13 +278,14 @@ def go(s):
     s = cut(s, "// 48 kHz for hdmi_tx on clk_pix", "// ------------------------------------------------------------------ debug",
             """// ------------------------------------------------------------------ VGA
 
-// 1024 x 768 at 60 Hz: negative syncs (VESA); the OSD output is registered with them
+// 1024 x 624 at 50 Hz (31.25 kHz): negative syncs as on HDMI, black outside de (the DAC has no blank
+// input); the OSD output is registered with them
 reg vga_hs = 1'b1, vga_vs = 1'b1;
 reg [23:0] vga_rgb = 24'd0;
 always @(posedge clk_pix) begin
-	vga_hs <= ~fb_hs;
-	vga_vs <= ~fb_vs;
-	vga_rgb <= osd_rgb;
+	vga_hs <= ~osd_hs;
+	vga_vs <= ~osd_vs;
+	vga_rgb <= osd_de ? osd_rgb : 24'd0;
 end
 assign VGA_R = vga_rgb[23:16];
 assign VGA_G = vga_rgb[15:8];
@@ -297,7 +298,7 @@ assign VGA_VS = vga_vs;
 
 
 MARK = "# ------------------------------------------------------------------------------------------------------------\n# Timing constraints"
-TMDS_AG_MARK = "\n\n# the TMDS serialisers (325 MHz)"
+TMDS_AG_MARK = "\n\n# the TMDS serialisers (160 MHz"
 
 
 def ucf(board):
@@ -307,17 +308,17 @@ def ucf(board):
     timing = g[g.index(MARK):]
     timing = sub(timing, "karabas_minig_top.v", "karabas_%s_top.v" % board, "ucf top")
     if board == "mini":
-        timing = sub(timing, "#   clk_8 (/81, 8.02 MHz): FT_CLK_OUT only (an ODDR2)\n",
-                     "#   clk_8 (/81, 8.02 MHz): FT_CLK_OUT only (an ODDR2)\n"
+        timing = sub(timing, "#   clk_8 (/80, 8 MHz): FT_CLK_OUT only (an ODDR2)\n",
+                     "#   clk_8 (/80, 8 MHz): FT_CLK_OUT only (an ODDR2)\n"
                      "# MCU_SCK is not on a clock pin before rev.G (local routing, bursts at the link clock).\n",
                      "ucf mini")
     if board == "go":
-        timing = sub(timing, "#   clk_hdmi / clk_hdmi_n (/2, 325 MHz, 0 / 180 degrees): the TMDS serialiser\n",
+        timing = sub(timing, "#   clk_hdmi / clk_hdmi_n (/4, 160 MHz, 0 / 180 degrees): the TMDS serialiser\n",
                      "#   clk_hdmi / clk_hdmi_n (/2): not used on Go (no HDMI)\n", "ucf go hdmi")
-        timing = sub(timing, "the 1024 x 768 output, the frame buffer read side, the OSD, HDMI audio\n",
-                     "the 1024 x 768 output (VGA, V_CLK), the frame buffer read side, the OSD\n", "ucf go pix")
-        timing = sub(timing, "#   clk_8 (/81, 8.02 MHz): FT_CLK_OUT only (an ODDR2)\n",
-                     "#   clk_8 (/81): not used on Go (no FT_CLK_OUT)\n", "ucf go clk_8")
+        timing = sub(timing, "the doubled picture 1024 x 624, the OSD, HDMI audio\n",
+                     "the doubled picture 1024 x 624 (VGA, V_CLK), the OSD\n", "ucf go pix")
+        timing = sub(timing, "#   clk_8 (/80, 8 MHz): FT_CLK_OUT only (an ODDR2)\n",
+                     "#   clk_8 (/80): not used on Go (no FT_CLK_OUT)\n", "ucf go clk_8")
         timing = sub(timing, 'NET "clk_hdmi" TNM_NET = "TG_CLK_HDMI";\n', "", "ucf go TG_CLK_HDMI")
         timing = sub(timing, "# zhdmi takes its words from clk_pix registers into the x5 clock (the serialiser of hdmi_tx)\n"
                      'TIMESPEC "TS_PIX_TO_HDMI" = FROM "TG_CLK_PIX" TO "TG_CLK_HDMI" TIG;\n', "", "ucf go TS_PIX_TO_HDMI")
